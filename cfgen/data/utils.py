@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 from scipy.sparse import issparse
 
 def normalize_expression(X, size_factor, normalization_type):
@@ -23,9 +24,9 @@ def normalize_expression(X, size_factor, normalization_type):
     if normalization_type == "proportions":
         X = X / size_factor
     elif normalization_type == "log_gexp":
-        X = torch.log1p(X)
+        X = np.log1p(X)
     elif normalization_type == "log_gexp_scaled":
-        X = torch.log1p(X / size_factor)
+        X = np.log1p(X / size_factor)
     else:
         raise NotImplementedError(f"Encoder type '{normalization_type}' is not implemented.")
     return X

@@ -21,6 +21,7 @@ def train(cfg: DictConfig):
     estimator = EncoderEstimator(cfg)
     # Train the encoder (checkpoints automatically dumped)
     estimator.train()
+    estimator.umaps()
     
 if __name__ == "__main__":
     import traceback

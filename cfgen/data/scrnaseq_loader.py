@@ -1,7 +1,8 @@
 import numpy as np
 import scanpy as sc
 import muon as mu
-import torch
+import jax.numpy as jnp
+import numpy as np
 import scipy
 from pathlib import Path
 from cfgen.data.utils import normalize_expression, compute_size_factor_lognorm
@@ -60,7 +61,7 @@ class RNAseqLoader:
         self.X = {}
         for mod in self.modality_list:
             mod_data = adata[mod].layers[layer_key]
-            self.X[mod] = torch.Tensor(mod_data.todense() if scipy.sparse.issparse(mod_data) else mod_data)
+            self.X[mod] = np.array(mod_data.todense() if scipy.sparse.issparse(mod_data) else mod_data)
 
         # Subsample if required
         if subsample_frac < 1:
@@ -80,7 +81,7 @@ class RNAseqLoader:
             unique_cov = np.unique(cov)
             zip_cov_cat = dict(zip(unique_cov, np.arange(len(unique_cov))))  
             self.id2cov[cov_name] = zip_cov_cat
-            self.Y_cov[cov_name] = torch.tensor([zip_cov_cat[c] for c in cov])
+            self.Y_cov[cov_name] = np.array([zip_cov_cat[c] for c in cov])
         
         # Compute mean, standard deviation, maximum and minimum size factor - dictionary only if non-binarized multimodal 
         if not self.is_binarized:
@@ -88,11 +89,11 @@ class RNAseqLoader:
             for mod in self.modality_list:
                 # Compute size factor for both RNA and Poisson ATAC
                 self.log_size_factor_mu[mod], self.log_size_factor_sd[mod] = compute_size_factor_lognorm(adata[mod], layer_key, self.id2cov)
-                log_size_factors = torch.log(self.X[mod].sum(1))
+                log_size_factors = np.log(self.X[mod].sum(1))
                 self.max_size_factor[mod], self.min_size_factor[mod] = log_size_factors.max(), log_size_factors.min()
         else:
             self.log_size_factor_mu, self.log_size_factor_sd = compute_size_factor_lognorm(adata["rna"], layer_key, self.id2cov)
-            log_size_factors = torch.log(self.X["rna"].sum(1))
+            log_size_factors = np.log(self.X["rna"].sum(1))
             self.max_size_factor, self.min_size_factor = log_size_factors.max(), log_size_factors.min()
                 
         del adata
@@ -119,6 +120,7 @@ class RNAseqLoader:
                 X_norm[mod] = normalize_expression(X[mod], X[mod].sum(), self.normalization_type)
             else:
                 X_norm[mod] = X[mod]
+
         return dict(X=X, X_norm=X_norm, y=y)
 
     def __len__(self):

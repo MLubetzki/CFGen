@@ -1,5 +1,9 @@
 from typing import Callable, List, Optional
-import torch
+
+import jax.numpy as jnp
+import flax.linen as nn
+
+# TODO fix documentation
 
 def unsqueeze_right(x, num_dims=1):
     """
@@ -48,16 +52,17 @@ def kl_std_normal(mean_squared, var):
     Returns:
         torch.Tensor: Gaussian KL divergence.
     """
-    return 0.5 * (var + mean_squared - torch.log(var.clamp(min=1e-15)) - 1.0)
+    return 0.5 * (var + mean_squared - jnp.log(var.clamp(min=1e-15)) - 1.0)
 
-class MLP(torch.nn.Module):
-    def __init__(self, 
-                 dims: List[int],
-                 batch_norm: bool, 
-                 dropout: bool, 
-                 dropout_p: float, 
-                 activation: Optional[Callable] = torch.nn.ELU, 
-                 final_activation: Optional[str] = None):
+class MLP(nn.Module):
+    dims: List[int]
+    batch_norm: bool
+    dropout: bool
+    dropout_p: float
+    activation: Optional[Callable] = nn.elu
+    final_activation: Optional[str] = None
+
+    def setup(self):
         """
         Multi-Layer Perceptron (MLP) model.
 
@@ -69,38 +74,31 @@ class MLP(torch.nn.Module):
             activation (Optional[Callable], optional): Activation function. Defaults to torch.nn.SELU.
             final_activation (Optional[str], optional): Final activation function ("tanh", "sigmoid", or None). Defaults to None.
         """
-        super(MLP, self).__init__()
-
-        # Attributes 
-        self.dims = dims
-        self.batch_norm = batch_norm
-        self.activation = activation
-
         # MLP 
         layers = []
-        for i in range(len(self.dims[:-2])):
+        for i in range(len(self.dims[:-1])):
             block = []
-            block.append(torch.nn.Linear(self.dims[i], self.dims[i+1]))
-            if batch_norm: 
-                block.append(torch.nn.BatchNorm1d(self.dims[i+1]))
-            block.append(self.activation())
-            if dropout:
-                block.append(torch.nn.Dropout(dropout_p))
-            layers.append(torch.nn.Sequential(*block))
+            block.append(nn.Dense(self.dims[i]))
+            if self.batch_norm: 
+                block.append(nn.BatchNorm(use_running_average=True)) # TODO adapt during train/test
+            block.append(self.activation)
+            if self.dropout:
+                block.append(nn.Dropout(dropout_p))
+            layers.append(nn.Sequential(block))
         
         # Last layer without activation 
-        layers.append(torch.nn.Linear(self.dims[-2], self.dims[-1]))
+        layers.append(nn.Dense(self.dims[-1]))
         # Compile the neural net
-        self.net = torch.nn.Sequential(*layers)
+        self.net = nn.Sequential(layers)
         
-        if final_activation == "tanh":
-            self.final_activation = torch.nn.Tanh()
-        elif final_activation == "sigmoid":
-            self.final_activation = torch.nn.Sigmoid()
+        if self.final_activation == "tanh":
+            self.final_activation_func = nn.tanh()
+        elif self.final_activation == "sigmoid":
+            self.final_activation_func = nn.sigmoid()
         else:
-            self.final_activation = None
+            self.final_activation_func = None
 
-    def forward(self, x):
+    def __call__(self, x):
         """
         Forward pass of the MLP.
 
@@ -110,8 +108,10 @@ class MLP(torch.nn.Module):
         Returns:
             torch.Tensor: Output tensor.
         """
+        #import IPython
+        #IPython.embed()
         x = self.net(x)
-        if not self.final_activation:
+        if not self.final_activation_func:
             return x
         else:
-            return self.final_activation(x)
+            return self.final_activation_func(x)
