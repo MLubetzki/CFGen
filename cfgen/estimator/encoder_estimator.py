@@ -116,7 +116,7 @@ class EncoderEstimator:
         Train the generative model using the provided trainer.
         """
         # Define the training step
-        @jax.jit
+        @jax.jit # TODO check if the model is really jit-able and make it if not
         def train_step(state, x):
             # Compute gradients
             loss, grads = jax.value_and_grad(state.apply_fn)({"params": state.params, "batch_stats": state.batch_stats}, x)
@@ -131,7 +131,7 @@ class EncoderEstimator:
         variables = self.encoder_model.init(key, x)
         params = variables["params"]
         batch_stats = variables["batch_stats"]
-        
+
         # Set up the optimizer and training state
         optimizer = optax.adam(self.args.encoder.learning_rate)
         state = TrainState.create(

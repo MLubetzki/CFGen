@@ -92,9 +92,11 @@ class MLP(nn.Module):
         self.net = nn.Sequential(layers)
         
         if self.final_activation == "tanh":
-            self.final_activation_func = nn.tanh()
+            self.final_activation_func = nn.tanh
         elif self.final_activation == "sigmoid":
-            self.final_activation_func = nn.sigmoid()
+            self.final_activation_func = nn.sigmoid
+        elif self.final_activation == "elu":
+            self.final_activation_func = nn.elu
         else:
             self.final_activation_func = None
 
@@ -108,8 +110,6 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor.
         """
-        #import IPython
-        #IPython.embed()
         x = self.net(x)
         if not self.final_activation_func:
             return x

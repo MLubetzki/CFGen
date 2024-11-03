@@ -4,7 +4,8 @@ import jax.random as random
 import flax.linen as nn
 
 from scvi.distributions import JaxNegativeBinomialMeanDisp as NegativeBinomial
-from torch.distributions import Poisson, Bernoulli
+from numpyro.distributions import Bernoulli, Poisson
+
 from cfgen.models.base.utils import MLP
 
 
@@ -34,11 +35,11 @@ class EncoderModel(nn.Module):
 
     """
     in_dim : dict
-    encoder_kwargs : dict # TODO ?
+    encoder_kwargs : dict
     learning_rate : float
     weight_decay : float
     covariate_specific_theta : bool
-    conditioning_covariate : str # TODO ?
+    conditioning_covariate : str
     n_cat : int=None
     is_binarized : bool=False
     encoder_multimodal_joint_layers: list=None
@@ -47,11 +48,6 @@ class EncoderModel(nn.Module):
         """
         Initializes the EncoderModel.
         """
-
-        # Joint into a single latent space or not 
-        if self.encoder_multimodal_joint_layers:
-            self.encoder_joint = None # Initialize another layer 
-
         # List of modalities present in the data 
         self.modality_list = list(self.encoder_kwargs.keys())
 
@@ -69,15 +65,16 @@ class EncoderModel(nn.Module):
         for mod in self.modality_list:
             encoder[mod] = MLP(**self.encoder_kwargs[mod])
             if self.encoder_multimodal_joint_layers:
-                self.encoder_kwargs[mod]["dims"].append(self.encoder_multimodal_joint_layers["dims"][-1]) # TODO don't modify dict, it's frozen
-            decoder_dims = {"dims": [*self.encoder_kwargs[mod]["dims"][::-1], self.in_dim[mod]]}
+                decoder_dims = {"dims": [self.encoder_multimodal_joint_layers["dims"][-1], 
+                                        *self.encoder_kwargs[mod]["dims"][::-1],
+                                        self.in_dim[mod]]}
+            else:
+                decoder_dims = {"dims": [*self.encoder_kwargs[mod]["dims"][::-1], self.in_dim[mod]]}
             decoder_kwargs = { key: value for key, value in self.encoder_kwargs[mod].items() if key != "dims" }
             decoder[mod] = MLP(**(decoder_dims | decoder_kwargs))
         
         # Shared modality part in the encoder 
         if self.encoder_multimodal_joint_layers:
-            joint_inputs = sum([self.encoder_kwargs[mod]["dims"][0] for mod in self.modality_list])
-            self.encoder_multimodal_joint_layers["dims"] = [joint_inputs, *self.encoder_multimodal_joint_layers["dims"]]
             self.encoder_joint = MLP(**self.encoder_multimodal_joint_layers)
 
         self.encoder = encoder
@@ -119,9 +116,9 @@ class EncoderModel(nn.Module):
                     px = NegativeBinomial(mu_hat[mod], jnp.exp(self.theta[y]))
             elif mod == "atac":
                 if not self.is_binarized:
-                    px = Poisson(rate=mu_hat[mod]) # TODO fix
+                    px = Poisson(mu_hat[mod])
                 else:
-                    px = Bernoulli(probs=mu_hat[mod]) # TODO fix
+                    px = Bernoulli(mu_hat[mod])
             else:
                 raise NotImplementedError
             loss -= px.log_prob(X[mod]).sum(1).mean()
@@ -145,9 +142,10 @@ class EncoderModel(nn.Module):
             z[mod] = self.encoder[mod](batch["X_norm"][mod])
             
         # Implement joint layers if defined
-        if self.encoder_multimodal_joint_layers:
-            z_joint = jnp.concatenate([z[mod] for mod in z], dim=-1)
-            z = self.encoder_joint(z_joint)     
+        if hasattr(self, "encoder_joint"):
+            z_joint = jnp.concatenate([z[mod] for mod in z], axis=-1)
+            z = self.encoder_joint(z_joint)   
+
         return z
 
     def decode(self, x, size_factor):
@@ -164,10 +162,10 @@ class EncoderModel(nn.Module):
         """
         mu_hat = {}
         for mod in self.modality_list:
-            if not self.encoder_multimodal_joint_layers:
-                x_mod = self.decoder[mod](x[mod])
-            else:
+            if hasattr(self, "encoder_joint"):
                 x_mod = self.decoder[mod](x)
+            else:
+                x_mod = self.decoder[mod](x[mod])
 
             if mod != "atac" or (mod == "atac" and not self.is_binarized):
                 mu_hat_mod = nn.softmax(x_mod, axis=1)  # for Poisson counts the parameterization is similar to RNA 
@@ -175,4 +173,5 @@ class EncoderModel(nn.Module):
             else:
                 mu_hat_mod = nn.sigmoid(x_mod)
             mu_hat[mod] = mu_hat_mod
+
         return mu_hat
