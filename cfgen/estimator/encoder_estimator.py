@@ -119,16 +119,22 @@ class EncoderEstimator:
         @jax.jit # TODO check if the model is really jit-able and make it if not
         def train_step(state, x):
             # Compute gradients
-            loss, grads = jax.value_and_grad(state.apply_fn)({"params": state.params, "batch_stats": state.batch_stats}, x)
-            # Apply gradients
+            (loss, updates), grads = jax.value_and_grad(state.apply_fn, has_aux=True)(
+                {"params": state.params, "batch_stats": state.batch_stats},
+                x,
+                train=True,
+                mutable="batch_stats")
+            
             state = state.apply_gradients(grads=grads["params"])
+            state = state.replace(batch_stats=updates['batch_stats'])
+
             return state, loss
 
         # Initialize model parameters
-        key = jax.random.PRNGKey(0)
+        key = jax.random.PRNGKey(42) # TODO allow setting a seed (to be reproducible, dataloader must be taken into consideration)
         x = next(iter(self.train_dataloader))  # First batch for shape inference
         x = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), x) # TODO this is hacky
-        variables = self.encoder_model.init(key, x)
+        variables = self.encoder_model.init(key, x, train=True)
         params = variables["params"]
         batch_stats = variables["batch_stats"]
 
@@ -147,7 +153,8 @@ class EncoderEstimator:
                 batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
                 state, loss = train_step(state, batch)
             print(f"Epoch {epoch}, Loss: {loss:.4f}")
-            self.test({"params": state.params, "batch_stats": state.batch_stats})
+            test_loss = self.test({"params": state.params, "batch_stats": state.batch_stats})
+            print(f"Test error: {test_loss:.4f}")
 
         self.final_checkpoint = {"params": state.params, "batch_stats": state.batch_stats}
 
@@ -165,9 +172,9 @@ class EncoderEstimator:
         loss = 0.0
         for batch in self.valid_dataloader:
             batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
-            loss += self.encoder_model.apply(variables, batch) # TODO jit
+            loss += self.encoder_model.apply(variables, batch, train=False) # TODO jit
 
-        print("Test Error %f" % loss)
+        return loss
 
 
     # TODO temporary helper, remove

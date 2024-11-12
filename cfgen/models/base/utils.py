@@ -62,45 +62,19 @@ class MLP(nn.Module):
     activation: Optional[Callable] = nn.elu
     final_activation: Optional[str] = None
 
-    def setup(self):
-        """
-        Multi-Layer Perceptron (MLP) model.
-
-        Args:
-            dims (List[int]): List of dimensions for each layer.
-            batch_norm (bool): Whether to use batch normalization.
-            dropout (bool): Whether to use dropout.
-            dropout_p (float): Dropout probability.
-            activation (Optional[Callable], optional): Activation function. Defaults to torch.nn.SELU.
-            final_activation (Optional[str], optional): Final activation function ("tanh", "sigmoid", or None). Defaults to None.
-        """
-        # MLP 
-        layers = []
-        for i in range(len(self.dims[:-1])):
-            block = []
-            block.append(nn.Dense(self.dims[i]))
-            if self.batch_norm: 
-                block.append(nn.BatchNorm(use_running_average=True)) # TODO adapt during train/test
-            block.append(self.activation)
-            if self.dropout:
-                block.append(nn.Dropout(dropout_p))
-            layers.append(nn.Sequential(block))
-        
-        # Last layer without activation 
-        layers.append(nn.Dense(self.dims[-1]))
-        # Compile the neural net
-        self.net = nn.Sequential(layers)
-        
+    # We're passing the final activation as a string from hydra. This returns the correct function
+    def get_final_activation(self):
         if self.final_activation == "tanh":
-            self.final_activation_func = nn.tanh
+            return nn.tanh
         elif self.final_activation == "sigmoid":
-            self.final_activation_func = nn.sigmoid
+            return nn.sigmoid
         elif self.final_activation == "elu":
-            self.final_activation_func = nn.elu
-        else:
-            self.final_activation_func = None
+            return nn.elu
 
-    def __call__(self, x):
+        return None     
+
+    @nn.compact
+    def __call__(self, x, train: bool=False):
         """
         Forward pass of the MLP.
 
@@ -110,8 +84,17 @@ class MLP(nn.Module):
         Returns:
             torch.Tensor: Output tensor.
         """
-        x = self.net(x)
-        if not self.final_activation_func:
+        for i in range(len(self.dims[:-1])):
+            x = nn.Dense(self.dims[i])(x)
+            if self.batch_norm:
+                x = nn.BatchNorm(use_running_average=not train)(x)
+            if self.dropout:
+                x = nn.Dropout(dropout_p, deterministic=not train)(x)
+            x = self.activation(x)
+        
+        x = nn.Dense(self.dims[-1])(x) # final layer
+        final_activation = self.get_final_activation()
+        if not final_activation:
             return x
         else:
-            return self.final_activation_func(x)
+            return final_activation(x)

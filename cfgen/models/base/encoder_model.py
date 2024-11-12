@@ -81,7 +81,7 @@ class EncoderModel(nn.Module):
         self.decoder = decoder
         # TODO save hyperparameters
 
-    def __call__(self, batch):
+    def __call__(self, batch, train : bool=False):
         """
         Executes a single step of training or validation.
 
@@ -99,8 +99,9 @@ class EncoderModel(nn.Module):
         # Conditioning covariate encodings
         y = batch["y"][self.conditioning_covariate]
 
-        z = self.encode(batch)
-        mu_hat = self.decode(z, size_factor)
+        z = self.encode(batch, train)
+        mu_hat = self.decode(z, size_factor, train)
+
         return self.calc_loss(X, mu_hat)
 
 
@@ -126,7 +127,7 @@ class EncoderModel(nn.Module):
         return loss
 
 
-    def encode(self, batch):
+    def encode(self, batch, train : bool=False):
         """
         Encodes input data.
 
@@ -139,16 +140,16 @@ class EncoderModel(nn.Module):
         """
         z = {}
         for mod in self.modality_list:
-            z[mod] = self.encoder[mod](batch["X_norm"][mod])
+            z[mod] = self.encoder[mod](batch["X_norm"][mod], train)
             
         # Implement joint layers if defined
         if hasattr(self, "encoder_joint"):
             z_joint = jnp.concatenate([z[mod] for mod in z], axis=-1)
-            z = self.encoder_joint(z_joint)   
+            z = self.encoder_joint(z_joint, train)   
 
         return z
 
-    def decode(self, x, size_factor):
+    def decode(self, x, size_factor, train : bool=False):
         """
         Decodes encoded data.
 
@@ -163,9 +164,9 @@ class EncoderModel(nn.Module):
         mu_hat = {}
         for mod in self.modality_list:
             if hasattr(self, "encoder_joint"):
-                x_mod = self.decoder[mod](x)
+                x_mod = self.decoder[mod](x, train)
             else:
-                x_mod = self.decoder[mod](x[mod])
+                x_mod = self.decoder[mod](x[mod], train)
 
             if mod != "atac" or (mod == "atac" and not self.is_binarized):
                 mu_hat_mod = nn.softmax(x_mod, axis=1)  # for Poisson counts the parameterization is similar to RNA 
