@@ -122,20 +122,6 @@ class EncoderEstimator:
         """
         Train the generative model using the provided trainer.
         """
-        # Define the training step
-        @jax.jit # TODO check if the model is really jit-able and make it if not
-        def train_step(state, x):
-            # Compute gradients
-            (loss, updates), grads = jax.value_and_grad(state.apply_fn, has_aux=True)(
-                {"params": state.params, "batch_stats": state.batch_stats},
-                x,
-                train=True,
-                mutable="batch_stats")
-            
-            state = state.apply_gradients(grads=grads["params"])
-            state = state.replace(batch_stats=updates['batch_stats'])
-
-            return state, loss
 
         # Initialize model parameters
         key = jax.random.PRNGKey(42) # TODO allow setting a seed (to be reproducible, dataloader must be taken into consideration)
@@ -163,8 +149,8 @@ class EncoderEstimator:
         for epoch in range(self.args.trainer.max_epochs):
             for batch in tqdm(self.train_dataloader):
                 batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
-                state, loss = train_step(state, batch)
-                
+                state, loss = self._train_step(state, batch)
+
             test_loss = self.test({"params": state.params, "batch_stats": state.batch_stats})
             print(f"Epoch {epoch}, train error: {loss:.4f}, test error: {test_loss:.4f}")
 
@@ -178,10 +164,23 @@ class EncoderEstimator:
         final_checkpoint = {"model": state}
         self.checkpointer.save(self.training_dir / "checkpoints" / "final_checkpoint", final_checkpoint, save_args=self.orbax_save_args)
 
+    
+    @partial(jax.jit, static_argnums=0)
+    def _train_step(state, x):
+        (loss, updates), grads = jax.value_and_grad(state.apply_fn, has_aux=True)(
+            {"params": state.params, "batch_stats": state.batch_stats},
+            x,
+            train=True,
+            mutable="batch_stats")
+        
+        state = state.apply_gradients(grads=grads["params"])
+        state = state.replace(batch_stats=updates['batch_stats'])
+
+        return state, loss
 
     # jitted batch loss for training
     @partial(jax.jit, static_argnums=0)
-    def _getBatchLoss(self, variables, batch):
+    def _valid_step(self, variables, batch):
         return self.encoder_model.apply(variables, batch, train=False)
 
     def test(self, variables=None):

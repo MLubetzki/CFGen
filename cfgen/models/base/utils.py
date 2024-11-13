@@ -3,8 +3,7 @@ from typing import Callable, List, Optional
 import jax.numpy as jnp
 import flax.linen as nn
 
-# TODO fix documentation
-
+# TODO unused, remove?
 def unsqueeze_right(x, num_dims=1):
     """
     Unsqueezes the last `num_dims` dimensions of `x`.
@@ -18,6 +17,7 @@ def unsqueeze_right(x, num_dims=1):
     """
     return x.view(x.shape + (1,) * num_dims)
 
+# TODO not tested yet. Adapt documentation
 def pad_t_like_x(t, x):
     """Function to reshape the time vector t by the number of dimensions of x.
 
@@ -41,6 +41,7 @@ def pad_t_like_x(t, x):
         return t
     return t.reshape(-1, *([1] * (x.dim() - 1)))
 
+# TODO unused, remove?
 def kl_std_normal(mean_squared, var):
     """
     Computes Gaussian KL divergence.
@@ -79,10 +80,11 @@ class MLP(nn.Module):
         Forward pass of the MLP.
 
         Args:
-            x (torch.Tensor): Input tensor.
+            x (numpy.ndarray): Input array.
+            train (bool): training vs test mode. If True, updates BatchNorm average and applies dropout
 
         Returns:
-            torch.Tensor: Output tensor.
+            numpy.ndarray: Output of the MLP.
         """
         for i in range(len(self.dims[:-1])):
             x = nn.Dense(self.dims[i])(x)

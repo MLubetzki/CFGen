@@ -6,8 +6,8 @@ def normalize_expression(X, size_factor, normalization_type):
     """Normalize gene expression data based on the specified encoder type.
 
     Args:
-        X (torch.Tensor): Input gene expression matrix.
-        size_factor (torch.Tensor): Size factors for normalization.
+        X (numpy.ndarray): Input gene expression matrix.
+        size_factor (numpy.ndarray): Size factors for normalization.
         normalization_type (str): Type of encoder for normalization. It can be one of the following:
                             - "proportions": Normalize by dividing by size factor.
                             - "log_gexp": Apply log transformation to gene expression data.
@@ -16,7 +16,7 @@ def normalize_expression(X, size_factor, normalization_type):
                             - "log_gexp_scaled": Apply log transformation after scaling by size factor.
 
     Returns:
-        torch.Tensor: Normalized gene expression data.
+        numpy.ndarray: Normalized gene expression data.
 
     Raises:
         NotImplementedError: If the encoder type is not recognized.
