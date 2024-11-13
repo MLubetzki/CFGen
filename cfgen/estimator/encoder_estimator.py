@@ -166,7 +166,7 @@ class EncoderEstimator:
 
     
     @partial(jax.jit, static_argnums=0)
-    def _train_step(state, x):
+    def _train_step(self, state, x):
         (loss, updates), grads = jax.value_and_grad(state.apply_fn, has_aux=True)(
             {"params": state.params, "batch_stats": state.batch_stats},
             x,
@@ -178,10 +178,11 @@ class EncoderEstimator:
 
         return state, loss
 
-    # jitted batch loss for training
+
     @partial(jax.jit, static_argnums=0)
     def _valid_step(self, variables, batch):
         return self.encoder_model.apply(variables, batch, train=False)
+
 
     def test(self, variables=None):
         """
@@ -196,7 +197,7 @@ class EncoderEstimator:
         loss = 0.0
         for batch in self.valid_dataloader:
             batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
-            loss += self._getBatchLoss(variables, batch)
+            loss += self._valid_step(variables, batch)
 
         return loss
 
