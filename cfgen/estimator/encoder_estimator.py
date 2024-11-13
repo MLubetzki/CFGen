@@ -1,15 +1,19 @@
 import os
+import math
 from pathlib import Path
 import uuid
+import logging
 import torch
 from torch.utils.data import random_split
+from tqdm import tqdm
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import flax.linen as nn
-from flax.training import train_state
+from flax.training import train_state, orbax_utils
 import optax
+import orbax.checkpoint
 
 from cfgen.paths import TRAINING_FOLDER
 from cfgen.data.scrnaseq_loader import RNAseqLoader
@@ -97,8 +101,10 @@ class EncoderEstimator:
         """
         Initialize Trainer.
         """
-        # TODO implement checkpointing / early stopping
-        
+        # Set up checkpointing
+        self.checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        logging.getLogger("absl").setLevel(logging.WARNING) # silence orbax logs
+   
         # TODO implement logging
 
     def init_model(self):
@@ -147,16 +153,29 @@ class EncoderEstimator:
             tx=optimizer
         )
 
+        # Prepare checkpointing
+        ckpt = {"model": state}
+        self.orbax_save_args = orbax_utils.save_args_from_target(ckpt)
+
+        lowest_test_loss = math.inf
         # Training loop
         for epoch in range(self.args.trainer.max_epochs):
-            for batch in self.train_dataloader:
+            for batch in tqdm(self.train_dataloader):
                 batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
                 state, loss = train_step(state, batch)
-            print(f"Epoch {epoch}, Loss: {loss:.4f}")
-            test_loss = self.test({"params": state.params, "batch_stats": state.batch_stats})
-            print(f"Test error: {test_loss:.4f}")
 
-        self.final_checkpoint = {"params": state.params, "batch_stats": state.batch_stats}
+            test_loss = self.test({"params": state.params, "batch_stats": state.batch_stats})
+            print(f"Epoch {epoch}, train error: {loss:.4f}, test error: {test_loss:.4f}")
+            
+            if test_loss < lowest_test_loss:
+                lowest_test_loss = test_loss
+                ckpt = {"model": state}
+                self.checkpointer.save(self.training_dir / "checkpoints" / "early_stopping_checkpoint", ckpt, save_args=self.orbax_save_args, force=True)
+
+
+        self.final_model = {"params": state.params, "batch_stats": state.batch_stats}
+        final_checkpoint = {"model": state}
+        self.checkpointer.save(self.training_dir / "checkpoints" / "final_checkpoint", final_checkpoint, save_args=self.orbax_save_args)
 
     def test(self, variables=None):
         """
@@ -167,7 +186,7 @@ class EncoderEstimator:
             if not hasattr(self, "final_activation"):
                 raise ValueError("You need to train the model or suppy a checkpoint")
             else:
-                variables = self.final_checkpoint
+                variables = self.final_model
 
         loss = 0.0
         for batch in self.valid_dataloader:
@@ -184,8 +203,8 @@ class EncoderEstimator:
             batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
             X = batch["X"]
             size_factor = {mod: jnp.expand_dims(X[mod].sum(1), 1) for mod in X}
-            encoded = self.encoder_model.apply(self.final_checkpoint, batch, method=self.encoder_model.encode)
-            decoded.append(self.encoder_model.apply(self.final_checkpoint, encoded, size_factor, method=self.encoder_model.decode)["rna"])
+            encoded = self.encoder_model.apply(self.final_model, batch, method=self.encoder_model.encode)
+            decoded.append(self.encoder_model.apply(self.final_model, encoded, size_factor, method=self.encoder_model.decode)["rna"])
         return np.concatenate(decoded, axis=0)
 
     # TODO temporary helper, remove
@@ -197,7 +216,7 @@ class EncoderEstimator:
 
         orig = self.valid_data.dataset[self.valid_data.indices]["X"]["rna"]
         gen_mu = self.reconstruct_dataset()
-        sampled = np.array(NegativeBinomial(gen_mu, jnp.exp(self.final_checkpoint["params"]["theta"])).sample(jax.random.PRNGKey(0)))
+        sampled = np.array(NegativeBinomial(gen_mu, jnp.exp(self.final_model["params"]["theta"])).sample(jax.random.PRNGKey(0)))
 
         adata_original_rna = sc.AnnData(X=orig)
         adata_generated_rna = sc.AnnData(X=sampled)
