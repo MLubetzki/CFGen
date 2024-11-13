@@ -1,6 +1,7 @@
 import os
 import math
 from pathlib import Path
+from functools import partial
 import uuid
 import logging
 import torch
@@ -163,10 +164,10 @@ class EncoderEstimator:
             for batch in tqdm(self.train_dataloader):
                 batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
                 state, loss = train_step(state, batch)
-
+                
             test_loss = self.test({"params": state.params, "batch_stats": state.batch_stats})
             print(f"Epoch {epoch}, train error: {loss:.4f}, test error: {test_loss:.4f}")
-            
+
             if test_loss < lowest_test_loss:
                 lowest_test_loss = test_loss
                 ckpt = {"model": state}
@@ -177,11 +178,16 @@ class EncoderEstimator:
         final_checkpoint = {"model": state}
         self.checkpointer.save(self.training_dir / "checkpoints" / "final_checkpoint", final_checkpoint, save_args=self.orbax_save_args)
 
+
+    # jitted batch loss for training
+    @partial(jax.jit, static_argnums=0)
+    def _getBatchLoss(self, variables, batch):
+        return self.encoder_model.apply(variables, batch, train=False)
+
     def test(self, variables=None):
         """
         Test the generative model.
         """
-
         if not variables:
             if not hasattr(self, "final_activation"):
                 raise ValueError("You need to train the model or suppy a checkpoint")
@@ -191,7 +197,7 @@ class EncoderEstimator:
         loss = 0.0
         for batch in self.valid_dataloader:
             batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
-            loss += self.encoder_model.apply(variables, batch, train=False) # TODO jit
+            loss += self._getBatchLoss(variables, batch)
 
         return loss
 
