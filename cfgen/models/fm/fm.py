@@ -1,45 +1,45 @@
 from typing import Literal
-import numpy as np
+# import numpy as np
 from pathlib import Path
 
-import torch
-from torch import nn, linspace
-from torch.distributions import Normal
+import jax.numpy as jnp
+import jax.random as random
+import flax.linen as nn
+import optax
 
-import pytorch_lightning as pl
-
-from scvi.distributions import NegativeBinomial
-from torch.distributions import Poisson, Bernoulli
+# from scvi.distributions import NegativeBinomial
+# from torch.distributions import Poisson, Bernoulli
 from cfgen.eval.evaluate import compute_umap_and_wasserstein
 from cfgen.models.base.utils import pad_t_like_x
 from cfgen.models.fm.ode import torch_wrapper
 from cfgen.models.fm.ot_sampler import OTPlanSampler
 
-from torchdyn.core import NeuralODE
+# from torchdyn.core import NeuralODE
 
-class FM(pl.LightningModule):
-    def __init__(self,
-                 encoder_model: nn.Module,
-                 denoising_model: nn.Module,
-                 feature_embeddings: dict, 
-                 plotting_folder: Path,
-                 in_dim: int,
-                 size_factor_statistics: dict,
-                 covariate_list: str, 
-                 theta_covariate: str,
-                 size_factor_covariate: str,
-                 encoder_type: str = "fixed", 
-                 learning_rate: float = 0.001, 
-                 weight_decay: float = 0.0001, 
-                 antithetic_time_sampling: bool = True, 
-                 scaling_method: str = "log_normalization",  # Change int to str
-                 sigma: float = 0.1, 
-                 covariate_specific_theta: float = False, 
-                 plot_and_eval_every=100, 
-                 use_ot=True, 
-                 is_binarized=False, 
-                 modality_list=None, 
-                 guidance_weights=None):
+class FM(nn.Module):
+    encoder_model: nn.Module
+    denoising_model: nn.Module
+    feature_embeddings: dict
+    plotting_folder: Path
+    in_dim: int
+    size_factor_statistics: dict
+    covariate_list: str
+    theta_covariate: str
+    size_factor_covariate: str
+    encoder_type: str = "fixed"
+    learning_rate: float = 0.001
+    weight_decay: float = 0.0001
+    antithetic_time_sampling: bool = True
+    scaling_method: str = "log_normalization" # Change int to str
+    sigma: float = 0.1
+    covariate_specific_theta: float = False
+    plot_and_eval_every: int=100 
+    use_ot: bool=True
+    is_binarized: bool=False
+    modality_list: list=None
+    guidance_weights: dict=None
+
+    def setup(self):
         """
         Flow matching for single-cell model. 
         
@@ -56,57 +56,17 @@ class FM(pl.LightningModule):
             scaling_method (str, optional): Scaling method for input data. Defaults to "log_normalization".
             sigma (float, optional): variance around straight path for flow matching objective.
         """
-        super().__init__()
-        
-        self.encoder_model = encoder_model
-        self.denoising_model = denoising_model.to(self.device)
-        self.feature_embeddings = feature_embeddings
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
-        self.in_dim = in_dim
-        self.size_factor_statistics = size_factor_statistics
-        self.encoder_type = encoder_type
-        self.antithetic_time_sampling = antithetic_time_sampling
-        self.scaling_method = scaling_method
-        self.plotting_folder = plotting_folder
-        self.covariate_list = covariate_list
-        self.theta_covariate = theta_covariate
-        self.size_factor_covariate = size_factor_covariate
-        self.sigma = sigma
-        self.covariate_specific_theta = covariate_specific_theta
-        self.plot_and_eval_every = plot_and_eval_every
-        self.use_ot = use_ot
-        self.is_binarized = is_binarized
-        self.modality_list = modality_list
-        self.guidance_weights = guidance_weights
-        
-        # MSE lost for the Flow Matching algorithm 
-        self.criterion = torch.nn.MSELoss()
+        self.criterion = optax.losses.squared_error
                 
         # Collection of testing observations for evaluation 
         self.testing_outputs = {mod: [] for mod in self.modality_list}
         
-        # save hyper-parameters to self.hparams (auto-logged by W&B)
-        self.save_hyperparameters()
-        
         # OT sampler
         if self.use_ot:
+            assert False # no u
             self.ot_sampler = OTPlanSampler(method="exact")
-    
-    def training_step(self, batch, batch_idx):
-        """
-        Training step for VDM.
 
-        Args:
-            batch: Batch data.
-            batch_idx: Batch index.
-
-        Returns:
-            torch.Tensor: Loss value.
-        """
-        return self._step(batch, dataset='train')
-
-    def _step(self, batch, dataset: Literal['train', 'valid']):
+    def __call__(self, batch, dataset: Literal['train', 'valid'], train: bool=False):
         """
         Common step for training and validation.
 
@@ -117,27 +77,24 @@ class FM(pl.LightningModule):
         Returns:
             torch.Tensor: Loss value.
         """
-        # Collect observation and put onto device 
         x = batch["X"]  # counts
-        x = {mod: x[mod].to(self.device) for mod in x}  # move to device
         
         # Collect labels 
         y_fea = self._featurize_batch_y(batch)
 
         # Encode observations into the latent space
-        with torch.no_grad():
-            x0 = self.encoder_model.encode(batch)
-            if not self.encoder_model.encoder_multimodal_joint_layers:
-                x0 = torch.cat([x0[mod] for mod in self.modality_list], dim=1)  # concatenate ordered by the modality list 
+        x0 = self.encoder_model.encode(batch)
+        if not hasattr(self.encoder_model, "encoder_joint"):
+            x0 = jnp.concatenate([x0[mod] for mod in self.modality_list], axis=1)  # concatenate ordered by the modality list 
 
         # Quantify size factor 
         if self.is_binarized:
             # If binarized, the size factor is not required for atac 
             size_factor = x["rna"].sum(1).unsqueeze(1)
-            log_size_factor = torch.log(size_factor)            
+            log_size_factor = jnp.log(size_factor)            
         else:
-            size_factor = {mod: x[mod].sum(1).unsqueeze(1) for mod in self.modality_list}
-            log_size_factor = {mod: torch.log(size_factor[mod]) for mod in self.modality_list}
+            size_factor = {mod: jnp.expand_dims(x[mod].sum(1), 1) for mod in self.modality_list}
+            log_size_factor = {mod: jnp.log(size_factor[mod]) for mod in self.modality_list}
         
         # Sample time 
         t = self._sample_times(x0.shape[0])  # B
@@ -153,10 +110,10 @@ class FM(pl.LightningModule):
         loss = self.criterion(u_t, v_t)  # (B, )
         
         # Save results
-        metrics = {
-            "batch_size": z.shape[0],
-            f"{dataset}/loss": loss.mean()}
-        self.log_dict(metrics, prog_bar=True)
+        # metrics = {
+        #     "batch_size": z.shape[0],
+        #     f"{dataset}/loss": loss.mean()}
+        # self.log_dict(metrics, prog_bar=True)
         
         return loss.mean()
     
@@ -187,14 +144,15 @@ class FM(pl.LightningModule):
         Returns:
             torch.Tensor: Sampled times.
         """
+        key = self.make_rng("time_sampling")
         if self.antithetic_time_sampling:
-            t0 = np.random.uniform(0, 1 / batch_size)
-            times = torch.arange(t0, 1.0, 1.0 / batch_size, device=self.device)
+            t0 = random.uniform(key, minval=0, maxval=1/batch_size)
+            times = jnp.arange(t0, 1.0, 1.0 / batch_size)
         else:
-            times = torch.rand(batch_size, device=self.device)
+            times = random.uniform(key, shape=batch_size)
         return times
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def sample(self,
                batch_size, 
                n_sample_steps,
@@ -291,7 +249,7 @@ class FM(pl.LightningModule):
             sample[mod] = distr.sample() 
         return sample
     
-    @torch.no_grad()
+    # @torch.no_grad()
     def batched_sample(self, 
                        batch_size, 
                        repetitions,
@@ -349,13 +307,13 @@ class FM(pl.LightningModule):
         return z
     
     def sample_noise_like(self, x):
-        return torch.randn_like(x)
+        return random.normal(self.make_rng("noise"), x.shape)
 
     def sample_location_and_conditional_flow(self, x0, x1, t=None):
         """
         Compute the sample xt (drawn from N(t * x1 + (1 - t) * x0, sigma))
         and the conditional vector field ut(x1|x0) = x1 - x0, see Eq.(15) [1]
-        with respect to the minibatch OT plan $\Pi$.
+        with respect to the minibatch OT plan $\\Pi$.
 
         Parameters
         ----------
@@ -381,10 +339,11 @@ class FM(pl.LightningModule):
         """
         # Resample from OT coupling 
         if self.use_ot:
+            assert False # NO U
             x0, x1 = self.ot_sampler.sample_plan(x0, x1)
         # Sample time 
         if t is None:
-            t = torch.rand(x0.shape[0]).type_as(x0)
+            t = random.uniform(self.make_rng("t"), x0.shape[0])
         assert len(t) == x0.shape[0], "t has to have batch size dimension"
 
         # Sample noise along straight line
@@ -493,26 +452,9 @@ class FM(pl.LightningModule):
         if self.use_ot:
             return x1 - x0
         else:
-            t = t.unsqueeze(1)
+            t = jnp.expand_dims(t, 1)
             return (x1 - (1 - self.sigma) * xt) / (1 - (1 - self.sigma) * t)
 
-    def configure_optimizers(self):
-        """
-        Optimizer configuration 
-
-        Returns:
-            dict: Optimizer configuration.
-        """
-        params = list(self.parameters())
-        
-        for covariate in self.feature_embeddings:
-            if not self.feature_embeddings[covariate].one_hot_encode_features:
-                params += list(self.feature_embeddings[covariate].parameters())
-                 
-        optimizer = torch.optim.AdamW(params, 
-                                    self.learning_rate, 
-                                    weight_decay=self.weight_decay)
-        return optimizer
 
     def validation_step(self, batch, batch_idx):
         """
@@ -542,11 +484,11 @@ class FM(pl.LightningModule):
         for mod in self.modality_list:
             self.testing_outputs[mod].append(batch["X"][mod].cpu())
 
-    def on_test_epoch_end(self, *arg, **kwargs):
+    def on_test_epoch_end(self, *arg, **kwargs): # TODO
         self.compute_metrics_and_plots(dataset_type="test")
         self.testing_outputs = {}
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def compute_metrics_and_plots(self, dataset_type, *arg, **kwargs):
         """
         Concatenates all observations from the test data loader in a single dataset.

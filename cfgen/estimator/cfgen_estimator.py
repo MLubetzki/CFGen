@@ -1,11 +1,10 @@
-import os
 from pathlib import Path
 import uuid
+import math
+import logging
+import numpy as np
 import torch
 from torch.utils.data import random_split
-from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import WandbLogger
 from cfgen.paths import TRAINING_FOLDER
 from cfgen.data.scrnaseq_loader import RNAseqLoader
 from cfgen.models.featurizers.category_featurizer import CategoricalFeaturizer
@@ -13,9 +12,18 @@ from cfgen.models.fm.denoising_model import MLPTimeStep
 from cfgen.models.fm.fm import FM
 from cfgen.models.base.encoder_model import EncoderModel
 
-# Some general settings for the run
-os.environ["WANDB__SERVICE_WAIT"] = "300"
-torch.autograd.set_detect_anomaly(True)
+import jax
+import flax.linen as nn
+from flax.training import train_state, orbax_utils
+import optax
+from tqdm import tqdm
+
+import orbax.checkpoint as ocp
+
+# Helper class to include batch stats in flax train_state
+class TrainState(train_state.TrainState):
+  batch_stats: dict
+
 
 class CfgenEstimator:
     """Class for training and using the cfgen model."""
@@ -43,8 +51,6 @@ class CfgenEstimator:
         self.training_dir.mkdir(parents=True, exist_ok=True)
         self.plotting_dir.mkdir(exist_ok=True)
 
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        
         print("Initialize data module...")
         self.init_datamodule()  # Initialize the data module  
         self.get_fixed_rna_model_params()  # Initialize the data derived model params 
@@ -100,25 +106,8 @@ class CfgenEstimator:
         """
         Initialize Trainer
         """
-        # Callbacks for saving checkpoints 
-        checkpoint_callback = ModelCheckpoint(dirpath=self.training_dir / "checkpoints", 
-                                                **self.args.checkpoints)
-        callbacks = [checkpoint_callback]
-        
-        # Early stopping checkpoints 
-        if self.args.training_config.use_early_stopping:
-            early_stopping_callbacks = EarlyStopping(**self.args.early_stopping)
-            callbacks.append(early_stopping_callbacks)
-        
-        # Logger settings 
-        self.logger = WandbLogger(save_dir=self.training_dir,
-                                    name=self.unique_id, 
-                                    **self.args.logger)
-        
-        self.trainer_generative = Trainer(callbacks=callbacks, 
-                                          default_root_dir=self.training_dir, 
-                                          logger=self.logger,
-                                          **self.args.trainer)
+        self.checkpointer = ocp.PyTreeCheckpointer()
+        logging.getLogger("absl").setLevel(logging.WARNING) # silence orbax logs
             
     def init_feature_embeddings(self):
         """
@@ -131,7 +120,6 @@ class CfgenEstimator:
         for cov, cov_names in self.dataset.id2cov.items():
             self.feature_embeddings[cov] = CategoricalFeaturizer(len(cov_names), 
                                                                     self.args.dataset.one_hot_encode_features, 
-                                                                    self.device, 
                                                                     embedding_dimensions=self.args.denoising_module.embedding_dim)
             if self.args.dataset.one_hot_encode_features:
                 self.num_classes[cov] = len(cov_names)
@@ -164,7 +152,7 @@ class CfgenEstimator:
                                         conditional=self.args.denoising_module.conditional, 
                                         is_binarized=self.is_binarized, 
                                         modality_list=self.modality_list, 
-                                        guided_conditioning=self.args.denoising_module.guided_conditioning).to(self.device)
+                                        guided_conditioning=self.args.denoising_module.guided_conditioning)
         
         print("Denoising model", denoising_model)
         
@@ -174,16 +162,14 @@ class CfgenEstimator:
                                           conditioning_covariate=self.args.dataset.theta_covariate, 
                                           **self.args.encoder)
         print("Encoder architecture", self.encoder_model)
+        print(self.encoder_model)
     
         # If model is pre-trained, load weights
         if self.args.training_config.encoder_ckpt != None:
-            # Load weights 
+            self.encoder_checkpointer = ocp.PyTreeCheckpointer()
             print(f"Load checkpoints from {self.args.training_config.encoder_ckpt}")
-            self.encoder_model.load_state_dict(torch.load(self.args.training_config.encoder_ckpt)["state_dict"])
-            # Freeze encoder 
-            for param in self.encoder_model.parameters():
-                param.requires_grad = False
-        self.encoder_model.eval()
+            self.encoder_checkpoint = self.encoder_checkpointer.restore(self.args.training_config.encoder_ckpt)
+
             
         # Flow matching model
         self.generative_model = FM(
@@ -206,16 +192,110 @@ class CfgenEstimator:
         """
         Train the generative model using the provided trainer.
         """
-        self.trainer_generative.fit(
-            self.generative_model,
-            train_dataloaders=self.train_dataloader,
-            val_dataloaders=self.valid_dataloader)
+        # self.trainer_generative.fit(
+        #     self.generative_model,
+        #     train_dataloaders=self.train_dataloader,
+        #     val_dataloaders=self.valid_dataloader)
+
+        # Initialize model parameters
+        key = jax.random.PRNGKey(42) # TODO allow setting a seed (to be reproducible, dataloader must be taken into consideration)
+        x = next(iter(self.train_dataloader))  # First batch for shape inference
+        x = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), x) # TODO this is hacky
+        variables = self.generative_model.init(key, x, "train", train=True)
+        params = variables["params"]
+        batch_stats = variables["batch_stats"]
+
+        # Set up the optimizer and training state
+        optimizer = optax.adam(self.args.generative_model.learning_rate)
+        state = TrainState.create(
+            apply_fn=self.generative_model.apply,
+            params=params,
+            batch_stats=batch_stats,
+            tx=optimizer
+        )
+
+        # Prepare checkpointing
+        ckpt = {"model": state}
+        self.orbax_save_args = orbax_utils.save_args_from_target(ckpt)
+
+        lowest_test_loss = math.inf
+        # Training loop
+        for epoch in range(self.args.trainer.max_epochs):
+            for batch in tqdm(self.train_dataloader):
+                batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
+                state, loss = self._train_step(state, batch)
+
+            test_loss = self.test({"params": state.params, "batch_stats": state.batch_stats})
+            print(f"Epoch {epoch}, train error: {loss:.4f}, test error: {test_loss:.4f}")
+
+            if test_loss < lowest_test_loss:
+                lowest_test_loss = test_loss
+                ckpt = {"model": state}
+                self.checkpointer.save(self.training_dir / "checkpoints" / "fm" / "early_stopping_checkpoint", ckpt, save_args=self.orbax_save_args, force=True)
+
+
+        self.final_model = {"params": state.params, "batch_stats": state.batch_stats}
+        final_checkpoint = {"model": state}
+        self.checkpointer.save(self.training_dir / "checkpoints" /"fm" / "final_checkpoint", final_checkpoint, save_args=self.orbax_save_args)
+
     
-    def test(self):
+#    @partial(jax.jit, static_argnums=0)
+    def _train_step(self, state, x):
+
+        def loss_fn(params, batch_stats, x):
+            return state.apply_fn(
+                {"params": params, "batch_stats": batch_stats},
+                x,
+                dataset="train",
+                train=True,
+                rngs={"time_sampling": jax.random.key(42), "noise": jax.random.key(1337), "guiding": jax.random.key(69)}, # TODO fix seeding
+                mutable="batch_stats")
+
+
+        (loss, updates), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, state.batch_stats, x)
+        
+        state = state.apply_gradients(grads=grads)
+        state = state.replace(batch_stats=updates['batch_stats'])
+
+        return state, loss
+    
+    # @partial(jax.jit, static_argnums=0)
+    def _valid_step(self, variables, batch):
+        return self.generative_model.apply(variables, batch, dataset="test", train=False, rngs={"time_sampling": jax.random.key(42), "noise": jax.random.key(1337), "guiding": jax.random.key(69)},)
+
+    def test(self, variables=None):
         """
         Test the generative model.
         """
-        self.trainer_generative.test(
-            self.generative_model,
-            dataloaders=self.valid_dataloader)
+        if not variables:
+            if not hasattr(self, "final_model"):
+                raise ValueError("You need to train the model or suppy a checkpoint")
+            else:
+                variables = self.final_model
+
+        loss = 0.0
+        for batch in self.valid_dataloader:
+            batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
+            loss += self._valid_step(variables, batch)
+
+        return loss
     
+
+    # TODO stolen from fm.py 
+    def configure_optimizers(self):
+        """
+        Optimizer configuration 
+
+        Returns:
+            dict: Optimizer configuration.
+        """
+        params = list(self.parameters())
+        
+        for covariate in self.feature_embeddings:
+            if not self.feature_embeddings[covariate].one_hot_encode_features:
+                params += list(self.feature_embeddings[covariate].parameters())
+                 
+        optimizer = torch.optim.AdamW(params, 
+                                    self.learning_rate, 
+                                    weight_decay=self.weight_decay)
+        return optimizer

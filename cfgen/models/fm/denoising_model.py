@@ -1,30 +1,27 @@
-import numpy as np
-import pytorch_lightning as pl
-import torch
-from torch import nn
-
+import jax.numpy as jnp
+import jax.random as random
+import flax.linen as nn
 from cfgen.models.fm.layer_utils import Linear
 
 # Util functions
-def zero_init(module):
-    """
-    Initializes the weights and biases of a PyTorch module with zero values.
+# def zero_init(module):
+#     """
+#     Initializes the weights and biases of a PyTorch module with zero values.
 
-    Args:
-        module (torch.nn.Module): PyTorch module for weight and bias initialization.
+#     Args:
+#         module (torch.nn.Module): PyTorch module for weight and bias initialization.
 
-    Returns:
-        torch.nn.Module: The input module with weights and biases initialized to zero.
-    """
-    nn.init.constant_(module.weight.data, 0)
-    if hasattr(module, 'bias') and module.bias is not None:
-        nn.init.constant_(module.bias.data, 0)
-    return module
+#     Returns:
+#         torch.nn.Module: The input module with weights and biases initialized to zero.
+#     """
+#     nn.init.constant_(module.weight.data, 0)
+#     if hasattr(module, 'bias') and module.bias is not None:
+#         nn.init.constant_(module.bias.data, 0)
+#     return module
 
 def get_timestep_embedding(
     timesteps,
     embedding_dim: int,
-    dtype=torch.float32,
     max_timescale=10_000,
     min_timescale=1,
     ):
@@ -34,7 +31,6 @@ def get_timestep_embedding(
     Args:
         timesteps (torch.Tensor): 1-dimensional tensor representing the input timesteps.
         embedding_dim (int): Dimensionality of the embedding. It must be an even number.
-        dtype (torch.dtype, optional): Data type for the resulting tensor. Default is torch.float32.
         max_timescale (float, optional): Maximum timescale value for the sinusoidal embedding. Default is 10,000.
         min_timescale (float, optional): Minimum timescale value for the sinusoidal embedding. Default is 1.
 
@@ -46,108 +42,100 @@ def get_timestep_embedding(
     assert embedding_dim % 2 == 0
     timesteps *= 1000.0  # In DDPM the time step is in [0, 1000], here [0, 1]
     num_timescales = embedding_dim // 2
-    inv_timescales = torch.logspace(  # or exp(-linspace(log(min), log(max), n))
-        -np.log10(min_timescale),
-        -np.log10(max_timescale),
-        num_timescales,
-        device=timesteps.device,
+    inv_timescales = jnp.logspace(  # or exp(-linspace(log(min), log(max), n))
+        -jnp.log10(min_timescale),
+        -jnp.log10(max_timescale),
+        num_timescales
     )
-    emb = timesteps.to(dtype)[:, None] * inv_timescales[None, :]  # (T, D/2)
-    return torch.cat([emb.sin(), emb.cos()], dim=1)  # (T, D)
+    emb = timesteps[:, None] * inv_timescales[None, :]  # (T, D/2)
+    return jnp.concat([jnp.sin(emb), jnp.cos(emb)], axis=1)  # (T, D)
 
+
+class GenericEmbedder(nn.Module):
+    dims: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.dims)(x)
+        x = nn.silu(x)
+        x = nn.Dense(self.dims)(x)
+        return x
+    
+class NormedSiluBlock(nn.Module):
+    dims: int
+    normalization: str=None
+    dropout: float=0.0 # TODO
+    zero_init: bool=False # whether to zero_init the linear layer
+    # TODO implement zero_init
+
+    @nn.compact
+    def __call__(self, x, train: bool=False):
+        if self.normalization in ["layer", "batch"]:
+            x = nn.LayerNorm()(x) if self.normalization == "layer" else nn.BatchNorm(use_running_average=not train)(x)
+        x = nn.silu(x)
+        if self.dropout > 0.0:
+            x = nn.Dropout(rate=self.dropout, deterministic=not train)(x)
+        x = nn.Dense(self.dims)(x)
+
+        return x
 
 # ResNet MLP 
-class MLPTimeStep(pl.LightningModule):
-    def __init__(self, 
-                 in_dim: int,
-                 hidden_dim: int,
-                 dropout_prob: int,
-                 n_blocks: int, 
-                 size_factor_min: float, 
-                 size_factor_max: float,
-                 embed_size_factor: bool,
-                 covariate_list: list,
-                 embedding_dim=128, 
-                 normalization="layer", 
-                 conditional=False,
-                 is_binarized=False, 
-                 modality_list=None, 
-                 conditioning_probability=0.8, 
-                 guided_conditioning=True):
-        
-        super().__init__()
-        
-        # Gene expression dimension 
-        self.in_dim = in_dim
-        
-        # The network downsizes the input multiple times 
-        self.hidden_dim = hidden_dim 
-        
-        # Initialize attributes 
-        self.size_factor_min = size_factor_min
-        self.size_factor_max = size_factor_max
-        self.embed_size_factor = embed_size_factor 
-        self.embedding_dim = embedding_dim
-        self.conditional = conditional
-        self.is_binarized = is_binarized
-        self.covariate_list = covariate_list
-        self.modality_list = modality_list
-        self.conditioning_probability = conditioning_probability  # Conditioning probability during the guiding 
-        self.guided_conditioning = guided_conditioning
-        
+class MLPTimeStep(nn.Module):
+    in_dim: int
+    hidden_dim: int
+    dropout_prob: int
+    n_blocks: int
+    size_factor_min: float
+    size_factor_max: float
+    embed_size_factor: bool
+    covariate_list: list
+    embedding_dim: int=128
+    normalization: str="layer"
+    conditional: bool=False
+    is_binarized: bool=False
+    modality_list: list=None
+    conditioning_probability: float=0.8 
+    guided_conditioning: bool=True
+
+
+    def setup(self):
         # Time embedding network
-        self.time_embedder = nn.Sequential(
-            Linear(embedding_dim, embedding_dim),  # Upsample embedding
-            nn.SiLU(),
-            Linear(embedding_dim, embedding_dim))
+        self.time_embedder = GenericEmbedder(dims=self.embedding_dim)
             
         # Size factor embeddings 
-        if embed_size_factor:
-            self.size_factor_embedder = nn.Sequential(
-                Linear(embedding_dim, embedding_dim),  # Upsample embedding
-                nn.SiLU(),
-                Linear(embedding_dim, embedding_dim))
+        if self.embed_size_factor:
+            self.size_factor_embedder = GenericEmbedder(dims=self.embedding_dim)
         
         # Initial convolution
-        self.net_in = Linear(in_dim, self.hidden_dim)
+        self.net_in = nn.Dense(self.hidden_dim)
 
         # Down path: n_blocks blocks with a resnet block and maybe attention.
-        self.blocks = []
-
         # Dimensionality preserving Resnet in the bottleneck 
-        for _ in range(n_blocks):
-            self.blocks.append(ResnetBlock(in_dim=self.hidden_dim,
+        self.blocks = [ResnetBlock(in_dim=self.hidden_dim,
                                                 out_dim=self.hidden_dim,
-                                                dropout_prob=dropout_prob,
-                                                embedding_dim=embedding_dim,  
-                                                normalization=normalization))
+                                                dropout_prob=self.dropout_prob,
+                                                embedding_dim=self.embedding_dim,  
+                                                normalization=self.normalization)
+                        for _ in range(self.n_blocks)]
         
-        # Set up blocks
-        self.blocks = nn.ModuleList(self.blocks)
-        
-        if normalization not in ["layer", "batch"]:
-            self.net_out = nn.Sequential(
-                nn.SiLU(),
-                Linear(self.hidden_dim, in_dim))
-        else:
-            self.net_out = nn.Sequential(
-                nn.LayerNorm(self.hidden_dim) if normalization=="layer" else nn.BatchNorm1d(num_features=self.hidden_dim),
-                nn.SiLU(),
-                Linear(self.hidden_dim, in_dim))
+        self.net_out = NormedSiluBlock(dims=self.in_dim, normalization=self.normalization)
 
-    def forward(self, x, t, l, y, inference=False, unconditional=False, covariate=None):        
+    def __call__(self, x, t, l, y, inference=False, unconditional=False, covariate=None):
+        guiding_prngkey = self.make_rng("guiding")     
         # Make a copy of time for using in time embeddings
-        t_for_embeddings = t.clone().detach().squeeze()
+        t_for_embeddings = t.squeeze() # TODO do we have to make a copy?
         
         # Time embedding   
         emb = self.time_embedder(get_timestep_embedding(t_for_embeddings, self.embedding_dim))
                 
         # Embed condition
-        if self.guided_conditioning:  
-            is_conditioned = torch.bernoulli(torch.tensor([self.conditioning_probability])).item() if not inference else 1. # Bernoulli variable to decide whether to condition or not
+        if self.guided_conditioning:
+            guiding_prngkey, subkey = random.split(guiding_prngkey) # TODO check if this works as intended
+            is_conditioned = random.bernoulli(subkey, self.conditioning_probability) if not inference else 1 # Bernoulli variable to decide whether to condition or not
             if self.conditional and is_conditioned and not unconditional:
                 if covariate == None:  
-                    covariate = np.random.choice(self.covariate_list)
+                    guiding_prngkey, subkey = random.split(guiding_prngkey) # TODO check if this works as intended
+                    covariate = self.covariate_list[int(random.choice(subkey, len(self.covariate_list)))]
                 emb = emb + y[covariate]
         else:
             # Normal conditioning 
@@ -176,6 +164,12 @@ class MLPTimeStep(pl.LightningModule):
         return pred 
 
 class ResnetBlock(nn.Module):
+    in_dim: int
+    out_dim: int=None
+    dropout_prob: float=0.0
+    embedding_dim: int=None
+    normalization: str="batch"
+
     """
     A block for a Multi-Layer Perceptron (MLP) with skip connection.
 
@@ -186,55 +180,21 @@ class ResnetBlock(nn.Module):
         dropout_prob (float, optional): Dropout probability. Defaults to 0.0.
         norm_groups (int, optional): Number of groups for layer normalization. Defaults to 32.
     """
-    def __init__(
-        self,
-        in_dim,
-        out_dim=None,
-        dropout_prob=0.0,
-        embedding_dim=None, 
-        normalization="batch"):
-        
-        super().__init__()
-                
-        # Variables controlling if time and size factor should be embedded
-        self.embedding_dim = embedding_dim
-    
-        # Set output_dim to input_dim if not provided
-        out_dim = in_dim if out_dim is None else out_dim
-        self.out_dim = out_dim
-
+    def setup(self): 
         # First linear block with LayerNorm and SiLU activation
-        if normalization not in ["layer", "batch"]:
-            self.net1 = nn.Sequential(
-                nn.SiLU(),
-                Linear(in_dim, out_dim))          
-        else:
-            self.net1 = nn.Sequential(
-                nn.LayerNorm(in_dim) if normalization=="layer" else nn.BatchNorm1d(num_features=in_dim),
-                nn.SiLU(),
-                Linear(in_dim, out_dim))
+        self.net1 = NormedSiluBlock(dims=self.out_dim, normalization=self.normalization)
         
         # Projections for conditions 
-        self.cond_proj = nn.Sequential(nn.SiLU(), Linear(self.embedding_dim, out_dim))
-            
+        self.cond_proj = NormedSiluBlock(self.out_dim)
+        
         # Second linear block with LayerNorm, SiLU activation, and optional dropout
-        if normalization not in ["layer", "batch"]:
-            self.net2 = nn.Sequential(
-                nn.SiLU(),
-                *([nn.Dropout(dropout_prob)] * (dropout_prob > 0.0)),
-                zero_init(Linear(out_dim, out_dim)))
-        else:
-            self.net2 = nn.Sequential(
-                nn.LayerNorm(out_dim) if normalization=="layer" else nn.BatchNorm1d(num_features=out_dim),
-                nn.SiLU(),
-                *([nn.Dropout(dropout_prob)] * (dropout_prob > 0.0)),
-                zero_init(Linear(out_dim, out_dim)))
+        self.net2 = NormedSiluBlock(dims=self.out_dim, normalization=self.normalization, dropout=self.dropout_prob, zero_init=True)
 
         # Linear projection for skip connection if input_dim and output_dim differ
-        if in_dim != out_dim:
-            self.skip_proj = Linear(in_dim, out_dim)
+        if self.out_dim != None and self.out_dim != self.in_dim:
+            self.skip_proj = nn.Dense(self.out_dim)
 
-    def forward(self, x, emb):
+    def __call__(self, x, emb):
         """
         Forward pass of the MLP block.
 
@@ -256,7 +216,7 @@ class ResnetBlock(nn.Module):
         h = self.net2(h)
 
         # Linear projection for skip connection if input_dim and output_dim differ
-        if x.shape[1] != self.out_dim:
+        if self.out_dim != None and x.shape[1] != self.out_dim:
             x = self.skip_proj(x)
 
         # Add skip connection to the output

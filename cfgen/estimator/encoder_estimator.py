@@ -167,7 +167,7 @@ class EncoderEstimator:
     
     @partial(jax.jit, static_argnums=0)
     def _train_step(self, state, x):
-        (loss, updates), grads = jax.value_and_grad(state.apply_fn, has_aux=True)(
+        (loss, updates), grads = jax.value_and_grad(state.apply_fn, has_aux=True)( # TODO this also performs unnecessary gradients wrt to the batch_stats, fix this
             {"params": state.params, "batch_stats": state.batch_stats},
             x,
             train=True,
@@ -189,7 +189,7 @@ class EncoderEstimator:
         Test the generative model.
         """
         if not variables:
-            if not hasattr(self, "final_activation"):
+            if not hasattr(self, "final_model"):
                 raise ValueError("You need to train the model or suppy a checkpoint")
             else:
                 variables = self.final_model

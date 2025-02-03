@@ -39,7 +39,7 @@ def pad_t_like_x(t, x):
     """
     if isinstance(t, (float, int)):
         return t
-    return t.reshape(-1, *([1] * (x.dim() - 1)))
+    return t.reshape(-1, *([1] * (x.ndim - 1)))
 
 # TODO unused, remove?
 def kl_std_normal(mean_squared, var):
