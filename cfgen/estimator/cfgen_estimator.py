@@ -186,7 +186,7 @@ class CfgenEstimator:
             modality_list=self.modality_list,
             guidance_weights=self.args.dataset.guidance_weights,
             **self.args.generative_model  # model_kwargs should contain the rest of the arguments
-            )
+            )        
 
     def train(self):
         """
@@ -204,6 +204,10 @@ class CfgenEstimator:
         variables = self.generative_model.init(key, x, "train", train=True)
         params = variables["params"]
         batch_stats = variables["batch_stats"]
+
+        # Restore encoder checkpoint
+        params["encoder_model"] = self.encoder_checkpoint["model"]["params"] # TODO it can't be intended that we have to do it this way. Read orbax docs!
+        batch_stats["encoder_model"] = self.encoder_checkpoint["model"]["batch_stats"]
 
         # Set up the optimizer and training state
         optimizer = optax.adam(self.args.generative_model.learning_rate)
@@ -252,6 +256,7 @@ class CfgenEstimator:
                 mutable="batch_stats")
 
 
+        # TODO make certain that the autoencoder parameters are not updated
         (loss, updates), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, state.batch_stats, x)
         
         state = state.apply_gradients(grads=grads)
@@ -269,7 +274,7 @@ class CfgenEstimator:
         """
         if not variables:
             if not hasattr(self, "final_model"):
-                raise ValueError("You need to train the model or suppy a checkpoint")
+                raise ValueError("You need to train the model or supply a checkpoint")
             else:
                 variables = self.final_model
 
@@ -278,6 +283,14 @@ class CfgenEstimator:
             batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
             loss += self._valid_step(variables, batch)
 
+
+        self.generative_model.apply(variables,
+                                    self.valid_data[:]["X"],
+                                    "test",
+                                    method=FM.compute_metrics_and_plots,
+                                    rngs={"time_sampling": jax.random.key(42), "noise": jax.random.key(1337), "guiding": jax.random.key(69)}
+                                    )
+ 
         return loss
     
 

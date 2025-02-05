@@ -190,7 +190,7 @@ class EncoderEstimator:
         """
         if not variables:
             if not hasattr(self, "final_model"):
-                raise ValueError("You need to train the model or suppy a checkpoint")
+                raise ValueError("You need to train the model or supply a checkpoint")
             else:
                 variables = self.final_model
 

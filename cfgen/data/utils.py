@@ -2,6 +2,8 @@ import torch
 import numpy as np
 from scipy.sparse import issparse
 
+# TODO adjust this file when switching the dataloader
+
 def normalize_expression(X, size_factor, normalization_type):
     """Normalize gene expression data based on the specified encoder type.
 

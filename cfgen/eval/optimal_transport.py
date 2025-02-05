@@ -1,14 +1,13 @@
 # From https://github.com/atong01/conditional-flow-matching/blob/v0/src/models/components/optimal_transport.py
 
-import torch
 from typing import Optional
 from functools import partial
 import ot
-import math
+import numpy as np
 
 def wasserstein(
-    x0: torch.Tensor,
-    x1: torch.Tensor,
+    x0: np.array,
+    x1: np.array,
     method: Optional[str] = None,
     reg: float = 0.05,
     power: int = 2,
@@ -43,14 +42,14 @@ def wasserstein(
         raise ValueError(f"Unknown method: {method}")
 
     a, b = ot.unif(x0.shape[0]), ot.unif(x1.shape[0])
-    if x0.dim() > 2:
+    if x0.ndim > 2:
         x0 = x0.reshape(x0.shape[0], -1)
-    if x1.dim() > 2:
+    if x1.ndim > 2:
         x1 = x1.reshape(x1.shape[0], -1)
-    M = torch.cdist(x0, x1)
+    M = np.sqrt(np.sum((x0[:, None, :] - x1[None, :, :]) ** 2, axis=-1)) # TODO check if this is correct
     if power == 2:
         M = M**2
-    ret = ot_fn(a, b, M.detach().cpu().numpy(), numItermax=1e7)
+    ret = ot_fn(a, b, M, numItermax=1e7)
     if power == 2:
-        ret = math.sqrt(ret)
+        ret = np.sqrt(ret)
     return ret

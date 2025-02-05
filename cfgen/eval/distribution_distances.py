@@ -25,22 +25,22 @@ def compute_distribution_distances(pred: torch.Tensor, true: Union[torch.Tensor,
         dict: Dictionary containing the computed distribution distances.
     """
     min_size = min(pred.shape[0], true.shape[0])
-    
+    # TODO include MMD distances again, when their implementation is ported/switched to jax
     names = [
         "1-Wasserstein",
         "2-Wasserstein",
-        "Linear_MMD",
-        "Poly_MMD"
+        # "Linear_MMD",
+        # "Poly_MMD"
     ]
     dists = []
     to_return = []
     w1 = wasserstein(pred, true, power=1)
     w2 = wasserstein(pred, true, power=2)
-    pred_4_mmd = pred[:min_size]
-    true_4_mmd = true[:min_size]
-    mmd_linear = linear_mmd2(pred_4_mmd, true_4_mmd).item()
-    mmd_poly = poly_mmd2(pred_4_mmd, true_4_mmd).item()
-    dists.append((w1, w2, mmd_linear, mmd_poly))
+    # pred_4_mmd = pred[:min_size]
+    # true_4_mmd = true[:min_size]
+    # mmd_linear = linear_mmd2(pred_4_mmd, true_4_mmd).item()
+    # mmd_poly = poly_mmd2(pred_4_mmd, true_4_mmd).item()
+    dists.append((w1, w2))#, mmd_linear, mmd_poly))
 
     to_return.extend(np.array(dists).mean(axis=0))
     return dict(zip(names, to_return))

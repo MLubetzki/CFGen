@@ -1,17 +1,21 @@
 from typing import Literal
 # import numpy as np
 from pathlib import Path
+from functools import partial
 
+import jax
 import jax.numpy as jnp
 import jax.random as random
 import flax.linen as nn
 import optax
+from diffrax import ODETerm, diffeqsolve, Dopri5
 
 # from scvi.distributions import NegativeBinomial
 # from torch.distributions import Poisson, Bernoulli
+from scvi.distributions import JaxNegativeBinomialMeanDisp as NegativeBinomial
+from numpyro.distributions import Bernoulli, Poisson
 from cfgen.eval.evaluate import compute_umap_and_wasserstein
 from cfgen.models.base.utils import pad_t_like_x
-from cfgen.models.fm.ode import torch_wrapper
 from cfgen.models.fm.ot_sampler import OTPlanSampler
 
 # from torchdyn.core import NeuralODE
@@ -57,10 +61,6 @@ class FM(nn.Module):
             sigma (float, optional): variance around straight path for flow matching objective.
         """
         self.criterion = optax.losses.squared_error
-                
-        # Collection of testing observations for evaluation 
-        self.testing_outputs = {mod: [] for mod in self.modality_list}
-        
         # OT sampler
         if self.use_ot:
             assert False # no u
@@ -151,6 +151,50 @@ class FM(nn.Module):
         else:
             times = random.uniform(key, shape=batch_size)
         return times
+    
+
+    def _conditioning_wrapper(self,
+                                t: jnp.ndarray,  # Time tensor
+                                x: jnp.ndarray,  # Input tensor
+                                diff_args: any,  # TODO does this fix the issue?
+                                l: dict,  # Log library size
+                                y: dict,  # Conditioning variable
+                                guidance_weights: dict,  # Weights for attribute-based guiding
+                                conditioning_covariates: list,  # Covariate names for conditioning
+                                unconditional: bool, # Flag for unconditional generation
+    ):
+        """
+        Forward pass of the torch_wrapper.
+
+        Args:
+            t: Time tensor, will be repeated for each sample in the batch.
+            x: Input tensor.
+            *args: Additional arguments.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            Tensor: The output of the model after applying conditioning.
+        """
+        # Repeat and concatenate time tensor to match the batch size
+        t = jnp.repeat(t, x.shape[0])[:, None]
+
+        # Unconditional generation or guided conditioning
+        if unconditional or self.denoising_model.guided_conditioning:
+            m_uncond = self.denoising_model(x, t, l, y, inference=True, unconditional=True, covariate=None)
+            m = jnp.copy(m_uncond)
+        
+        # Conditional generation
+        if not unconditional:
+            if self.denoising_model.guided_conditioning:
+                # Apply guided conditioning using provided weights
+                for cov in conditioning_covariates:
+                    m += guidance_weights[cov] * \
+                         (self.denoising_model(x, t, l, y, inference=True, unconditional=False, covariate=cov) - m_uncond)
+            else:
+                # Normal conditioning without guidance
+                m = self.denoising_model(x, t, l, y, inference=True, unconditional=False, covariate=None)
+        
+        return m
 
     # @torch.no_grad()
     def sample(self,
@@ -168,67 +212,64 @@ class FM(nn.Module):
             guidance_weights=self.guidance_weights
             
         # Sample random noise 
-        z = torch.randn((batch_size, self.denoising_model.in_dim), device=self.device)
+        z = random.normal(self.make_rng("noise"), (batch_size, self.denoising_model.in_dim))
 
         # Sample random classes from the sampling covariates
         if covariate_indices==None:
             covariate_indices = {}
             for covariate in conditioning_covariates:  # for the covariates we decide to condition on 
-                covariate_indices[covariate] = torch.randint(0, self.feature_embeddings[covariate].n_cat, (batch_size,))
+                covariate_indices[covariate] = random.randint(self.make_rng("noise"), shape=(batch_size,), minval=0, maxval=self.feature_embeddings[covariate].n_cat) # TODO create new rng stream
              
+        # TODO fix this in the dataloader, then adjust the calculation to work on self.size_factor_statistics
+        size_factor_statistics = jax.tree.map(lambda tensor: tensor.numpy().astype(jnp.float32), self.size_factor_statistics) # TODO this is hacky
+
         # Sample size factor from the associated distribution
         if log_size_factor==None:
             # If size factor conditions the denoising, sample from the log-norm distribution. Else the size factor is None
             if not self.is_binarized:
                 log_size_factor = {}
                 for mod in self.modality_list:
-                    mean_size_factor, sd_size_factor = self.size_factor_statistics["mean"][mod][size_factor_covariate], self.size_factor_statistics["sd"][mod][size_factor_covariate]
+                    mean_size_factor, sd_size_factor = size_factor_statistics["mean"][mod][size_factor_covariate], size_factor_statistics["sd"][mod][size_factor_covariate]
                     mean_size_factor, sd_size_factor = mean_size_factor[covariate_indices[size_factor_covariate]], sd_size_factor[covariate_indices[size_factor_covariate]]
-                    size_factor_dist = Normal(loc=mean_size_factor, scale=sd_size_factor)
-                    log_size_factor_mod = size_factor_dist.sample().to(self.device).view(-1, 1)
+                    size_factor_dist = mean_size_factor + sd_size_factor*random.normal(self.make_rng("noise"), shape=mean_size_factor.shape) # TODO rng stream
+                    log_size_factor_mod = size_factor_dist.reshape(-1, 1)
                     log_size_factor[mod] = log_size_factor_mod
             else:
-                mean_size_factor, sd_size_factor = self.size_factor_statistics["mean"][size_factor_covariate], self.size_factor_statistics["sd"][size_factor_covariate]
+                mean_size_factor, sd_size_factor = size_factor_statistics["mean"][size_factor_covariate], size_factor_statistics["sd"][size_factor_covariate]
                 mean_size_factor, sd_size_factor = mean_size_factor[covariate_indices[size_factor_covariate]], sd_size_factor[covariate_indices[size_factor_covariate]]
-                size_factor_dist = Normal(loc=mean_size_factor, scale=sd_size_factor)
-                log_size_factor = size_factor_dist.sample().to(self.device).view(-1, 1)
+                size_factor_dist = mean_size_factor + sd_size_factor*random.normal(self.make_rng("noise"), shape=mean_size_factor.shape) # TODO rng stream
+                log_size_factor = size_factor_dist.reshape(-1, 1)
         
         # Featurize the covariate
         if not unconditional:
             y = {}
             for covariate in covariate_indices:
-                y[covariate] = self.feature_embeddings[covariate](covariate_indices[covariate].to(self.device))
+                y[covariate] = self.feature_embeddings[covariate](covariate_indices[covariate])
         else: 
             y = None
 
         # Generate 
-        t = linspace(0.0, 1.0, n_sample_steps, device=self.device)
-                
-        denoising_model_ode = torch_wrapper(self.denoising_model, 
-                                            log_size_factor, 
-                                            y,
-                                            guidance_weights=guidance_weights,
-                                            conditioning_covariates=conditioning_covariates, 
-                                            unconditional=unconditional)    
+        denoising_model_ode = partial(self._conditioning_wrapper,
+                                      l=log_size_factor,
+                                      y=y,
+                                      guidance_weights=guidance_weights,
+                                      conditioning_covariates=conditioning_covariates,
+                                      unconditional=unconditional)
+
+        term = ODETerm(denoising_model_ode)
+        solver = Dopri5()
+        x0 = diffeqsolve(term, solver, t0=0.0, t1=1.0, y0=z, dt0=1.0/n_sample_steps).ys[-1].squeeze()
         
-        self.node = NeuralODE(denoising_model_ode,
-                                solver="dopri5", 
-                                sensitivity="adjoint", 
-                                atol=1e-5, 
-                                rtol=1e-5)        
-        
-        x0 = self.node.trajectory(z, t_span=t)[-1]
-        
-        # If multimodal, split the output to get separate z's
+        # If we use joint layers, split the output to get separate z's
         if not self.encoder_model.encoder_multimodal_joint_layers:
-            x0 = torch.split(x0, [self.in_dim[d] for d in self.modality_list], dim=1)
+            x0 = jnp.split(x0, [self.in_dim[d] for d in self.modality_list], axis=1)
             x0 = {mod: x0[i] for i, mod in enumerate(self.modality_list)}
 
         # Exponentiate log-size factor for decoding  
         if not self.is_binarized:
-            size_factor = {mod: torch.exp(log_size_factor[mod]) for mod in self.modality_list}
+            size_factor = {mod: jnp.exp(log_size_factor[mod]) for mod in self.modality_list}
         else:
-            size_factor = torch.exp(log_size_factor)
+            size_factor = jnp.exp(log_size_factor)
             
         # Decode to parameterize sampling distributions
         x = self._decode(x0, size_factor)
@@ -238,15 +279,15 @@ class FM(nn.Module):
         for mod in x:
             if mod=="rna":  
                 if not self.covariate_specific_theta:
-                    distr = NegativeBinomial(mu=x[mod], theta=torch.exp(self.encoder_model.theta))
+                    distr = NegativeBinomial(mean=x[mod], inverse_dispersion=jnp.exp(self.encoder_model.theta))
                 else:
-                    distr = NegativeBinomial(mu=x[mod], theta=torch.exp(self.encoder_model.theta[covariate_indices[theta_covariate]]))
+                    distr = NegativeBinomial(mean=x[mod], inverse_dispersion=jnp.exp(self.encoder_model.theta[covariate_indices[theta_covariate]]))
             else:  # if mod is atac
                 if not self.encoder_model.is_binarized:
                     distr = Poisson(rate=x[mod])
                 else:
                     distr = Bernoulli(probs=x[mod])
-            sample[mod] = distr.sample() 
+            sample[mod] = distr.sample(self.make_rng("noise")) # TODO fix rng stream
         return sample
     
     # @torch.no_grad()
@@ -294,10 +335,10 @@ class FM(nn.Module):
                                     unconditional)
                 
             for mod in X_samples:
-                total_samples[mod].append(X_samples[mod].cpu())                
+                total_samples[mod].append(X_samples[mod])                
         
         # Concatenate observations in the samples 
-        return {mod: torch.cat(total_samples[mod], dim=0) for mod in self.modality_list}                
+        return {mod: jnp.concat(total_samples[mod], axis=0) for mod in self.modality_list}                
 
     def _decode(self, z, size_factor):
         # Decode the rescaled z
@@ -480,16 +521,10 @@ class FM(nn.Module):
         Returns:
             torch.Tensor: Loss value.
         """
-        # Append the batches
-        for mod in self.modality_list:
-            self.testing_outputs[mod].append(batch["X"][mod].cpu())
-
-    def on_test_epoch_end(self, *arg, **kwargs): # TODO
-        self.compute_metrics_and_plots(dataset_type="test")
-        self.testing_outputs = {}
+        pass
 
     # @torch.no_grad()
-    def compute_metrics_and_plots(self, dataset_type, *arg, **kwargs):
+    def compute_metrics_and_plots(self, data, dataset_type, *arg, **kwargs):
         """
         Concatenates all observations from the test data loader in a single dataset.
 
@@ -499,25 +534,20 @@ class FM(nn.Module):
         Returns:
             None
         """
-        # Concatenate all test observations
-        testing_outputs = {mod: torch.cat(self.testing_outputs[mod], dim=0) for mod in self.testing_outputs}
-        
+        batch_size = 1000
+        repetitions = batch_size // 100
+        X_generated_dict = self.batched_sample(100, repetitions, 20, self.theta_covariate, self.size_factor_covariate, self.covariate_list) # TODO change sample steps back to 2?
         # Plot UMAP of generated cells and real test cells
-        wd = compute_umap_and_wasserstein(model=self, 
-                                            batch_size=1000, 
-                                            n_sample_steps=2, 
-                                            plotting_folder=self.plotting_folder, 
-                                            X_real=testing_outputs, 
-                                            epoch=self.current_epoch,
-                                            theta_covariate=self.theta_covariate,
-                                            size_factor_covariate=self.size_factor_covariate)
+        wd = compute_umap_and_wasserstein(X_generated_dict,
+                                          X_real=data, plotting_folder=self.plotting_folder,
+                                          epoch=0, # TODO fix
+                                          modality_list=self.modality_list)
         
-        del testing_outputs
         metric_dict = {}
         for key in wd:
             metric_dict[f"{dataset_type}_{key}"] = wd[key]
 
         # Compute Wasserstein distance between real test set and generated data 
-        self.log_dict(wd)
+        # TODO self.log_dict(wd)
         return wd
     
