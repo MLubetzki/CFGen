@@ -144,7 +144,7 @@ class FM(nn.Module):
         Returns:
             torch.Tensor: Sampled times.
         """
-        key = self.make_rng("time_sampling")
+        key = self.make_rng("distr")
         if self.antithetic_time_sampling:
             t0 = random.uniform(key, minval=0, maxval=1/batch_size)
             times = jnp.arange(t0, 1.0, 1.0 / batch_size)
@@ -189,12 +189,13 @@ class FM(nn.Module):
                 # Apply guided conditioning using provided weights
                 for cov in conditioning_covariates:
                     m += guidance_weights[cov] * \
-                         (self.denoising_model(x, t, l, y, inference=True, unconditional=False, covariate=cov) - m_uncond)
+                            (self.denoising_model(x, t, l, y, inference=True, unconditional=False, covariate=cov) - m_uncond)
             else:
                 # Normal conditioning without guidance
                 m = self.denoising_model(x, t, l, y, inference=True, unconditional=False, covariate=None)
         
         return m
+    
 
     # @torch.no_grad()
     def sample(self,
@@ -212,13 +213,13 @@ class FM(nn.Module):
             guidance_weights=self.guidance_weights
             
         # Sample random noise 
-        z = random.normal(self.make_rng("noise"), (batch_size, self.denoising_model.in_dim))
+        z = random.normal(self.make_rng("distr"), (batch_size, self.denoising_model.in_dim))
 
         # Sample random classes from the sampling covariates
         if covariate_indices==None:
             covariate_indices = {}
             for covariate in conditioning_covariates:  # for the covariates we decide to condition on 
-                covariate_indices[covariate] = random.randint(self.make_rng("noise"), shape=(batch_size,), minval=0, maxval=self.feature_embeddings[covariate].n_cat) # TODO create new rng stream
+                covariate_indices[covariate] = random.randint(self.make_rng("distr"), shape=(batch_size,), minval=0, maxval=self.feature_embeddings[covariate].n_cat)
              
         # TODO fix this in the dataloader, then adjust the calculation to work on self.size_factor_statistics
         size_factor_statistics = jax.tree.map(lambda tensor: tensor.numpy().astype(jnp.float32), self.size_factor_statistics) # TODO this is hacky
@@ -231,13 +232,13 @@ class FM(nn.Module):
                 for mod in self.modality_list:
                     mean_size_factor, sd_size_factor = size_factor_statistics["mean"][mod][size_factor_covariate], size_factor_statistics["sd"][mod][size_factor_covariate]
                     mean_size_factor, sd_size_factor = mean_size_factor[covariate_indices[size_factor_covariate]], sd_size_factor[covariate_indices[size_factor_covariate]]
-                    size_factor_dist = mean_size_factor + sd_size_factor*random.normal(self.make_rng("noise"), shape=mean_size_factor.shape) # TODO rng stream
+                    size_factor_dist = mean_size_factor + sd_size_factor*random.normal(self.make_rng("distr"), shape=mean_size_factor.shape)
                     log_size_factor_mod = size_factor_dist.reshape(-1, 1)
                     log_size_factor[mod] = log_size_factor_mod
             else:
                 mean_size_factor, sd_size_factor = size_factor_statistics["mean"][size_factor_covariate], size_factor_statistics["sd"][size_factor_covariate]
                 mean_size_factor, sd_size_factor = mean_size_factor[covariate_indices[size_factor_covariate]], sd_size_factor[covariate_indices[size_factor_covariate]]
-                size_factor_dist = mean_size_factor + sd_size_factor*random.normal(self.make_rng("noise"), shape=mean_size_factor.shape) # TODO rng stream
+                size_factor_dist = mean_size_factor + sd_size_factor*random.normal(self.make_rng("distr"), shape=mean_size_factor.shape)
                 log_size_factor = size_factor_dist.reshape(-1, 1)
         
         # Featurize the covariate
@@ -287,7 +288,7 @@ class FM(nn.Module):
                     distr = Poisson(rate=x[mod])
                 else:
                     distr = Bernoulli(probs=x[mod])
-            sample[mod] = distr.sample(self.make_rng("noise")) # TODO fix rng stream
+            sample[mod] = distr.sample(self.make_rng("distr"))
         return sample
     
     # @torch.no_grad()
@@ -348,7 +349,7 @@ class FM(nn.Module):
         return z
     
     def sample_noise_like(self, x):
-        return random.normal(self.make_rng("noise"), x.shape)
+        return random.normal(self.make_rng("distr"), x.shape)
 
     def sample_location_and_conditional_flow(self, x0, x1, t=None):
         """
@@ -384,7 +385,7 @@ class FM(nn.Module):
             x0, x1 = self.ot_sampler.sample_plan(x0, x1)
         # Sample time 
         if t is None:
-            t = random.uniform(self.make_rng("t"), x0.shape[0])
+            t = random.uniform(self.make_rng("distr"), x0.shape[0])
         assert len(t) == x0.shape[0], "t has to have batch size dimension"
 
         # Sample noise along straight line

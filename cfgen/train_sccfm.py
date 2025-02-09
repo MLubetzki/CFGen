@@ -2,6 +2,7 @@ import hydra
 import sys
 from omegaconf import DictConfig
 from cfgen.estimator.cfgen_estimator import CfgenEstimator
+import jax
 
 @hydra.main(config_path="../configs/configs_sccfm", config_name="train", version_base=None)
 def train(cfg: DictConfig):
@@ -21,7 +22,7 @@ def train(cfg: DictConfig):
     estimator = CfgenEstimator(cfg)
     # Train and test 
     estimator.train()
-    estimator.test()
+    estimator.test({"distr": jax.random.PRNGKey(42), "guiding": jax.random.PRNGKey(1337)})
 
     # TODO implement
     # Get test metric dictionary

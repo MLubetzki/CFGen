@@ -3,9 +3,12 @@ import uuid
 import math
 import logging
 import numpy as np
+from functools import partial
+
 import torch
 from torch.utils.data import random_split
 from cfgen.paths import TRAINING_FOLDER
+from cfgen.models.base.utils import split_rng_dict
 from cfgen.data.scrnaseq_loader import RNAseqLoader
 from cfgen.models.featurizers.category_featurizer import CategoricalFeaturizer
 from cfgen.models.fm.denoising_model import MLPTimeStep
@@ -14,6 +17,7 @@ from cfgen.models.base.encoder_model import EncoderModel
 
 import jax
 import flax.linen as nn
+from flax import traverse_util
 from flax.training import train_state, orbax_utils
 import optax
 from tqdm import tqdm
@@ -192,11 +196,6 @@ class CfgenEstimator:
         """
         Train the generative model using the provided trainer.
         """
-        # self.trainer_generative.fit(
-        #     self.generative_model,
-        #     train_dataloaders=self.train_dataloader,
-        #     val_dataloaders=self.valid_dataloader)
-
         # Initialize model parameters
         key = jax.random.PRNGKey(42) # TODO allow setting a seed (to be reproducible, dataloader must be taken into consideration)
         x = next(iter(self.train_dataloader))  # First batch for shape inference
@@ -210,7 +209,13 @@ class CfgenEstimator:
         batch_stats["encoder_model"] = self.encoder_checkpoint["model"]["batch_stats"]
 
         # Set up the optimizer and training state
-        optimizer = optax.adam(self.args.generative_model.learning_rate)
+        partition_optimizers = {'trainable': optax.adamw(self.args.generative_model.learning_rate,
+                                                        weight_decay=self.args.generative_model.weight_decay),
+                                 'frozen': optax.set_to_zero()}
+        param_partitions = traverse_util.path_aware_map(
+                                lambda path, v: 'frozen' if 'encoder_model' in path else 'trainable', params)
+        optimizer = optax.multi_transform(partition_optimizers, param_partitions)
+
         state = TrainState.create(
             apply_fn=self.generative_model.apply,
             params=params,
@@ -222,18 +227,24 @@ class CfgenEstimator:
         ckpt = {"model": state}
         self.orbax_save_args = orbax_utils.save_args_from_target(ckpt)
 
-        lowest_test_loss = math.inf
+        # Initialize random keys
+        # TODO allow setting a seed from config
+        rngs = {"distr": jax.random.PRNGKey(42), "guiding": jax.random.PRNGKey(1337)}
+        lowest_valid_loss = math.inf
+
         # Training loop
         for epoch in range(self.args.trainer.max_epochs):
             for batch in tqdm(self.train_dataloader):
                 batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
-                state, loss = self._train_step(state, batch)
+                subrngs, rngs = split_rng_dict(rngs)
+                state, loss = self._train_step(state, batch, subrngs)
 
-            test_loss = self.test({"params": state.params, "batch_stats": state.batch_stats})
-            print(f"Epoch {epoch}, train error: {loss:.4f}, test error: {test_loss:.4f}")
+            subrngs, rngs = split_rng_dict(rngs)
+            valid_loss = self.validate(subrngs, {"params": state.params, "batch_stats": state.batch_stats})
+            print(f"Epoch {epoch}, train error: {loss:.4f}, test error: {valid_loss:.4f}")
 
-            if test_loss < lowest_test_loss:
-                lowest_test_loss = test_loss
+            if valid_loss < lowest_valid_loss:
+                lowest_valid_loss = valid_loss
                 ckpt = {"model": state}
                 self.checkpointer.save(self.training_dir / "checkpoints" / "fm" / "early_stopping_checkpoint", ckpt, save_args=self.orbax_save_args, force=True)
 
@@ -243,32 +254,36 @@ class CfgenEstimator:
         self.checkpointer.save(self.training_dir / "checkpoints" /"fm" / "final_checkpoint", final_checkpoint, save_args=self.orbax_save_args)
 
     
-#    @partial(jax.jit, static_argnums=0)
-    def _train_step(self, state, x):
-
+    def _train_step(self, state, x, rngs):
         def loss_fn(params, batch_stats, x):
             return state.apply_fn(
                 {"params": params, "batch_stats": batch_stats},
                 x,
                 dataset="train",
                 train=True,
-                rngs={"time_sampling": jax.random.key(42), "noise": jax.random.key(1337), "guiding": jax.random.key(69)}, # TODO fix seeding
+                rngs=rngs,
                 mutable="batch_stats")
 
-
-        # TODO make certain that the autoencoder parameters are not updated
         (loss, updates), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params, state.batch_stats, x)
         
         state = state.apply_gradients(grads=grads)
-        state = state.replace(batch_stats=updates['batch_stats'])
+        state = state.replace(batch_stats=updates['batch_stats']) # TODO only for FM
 
         return state, loss
     
-    # @partial(jax.jit, static_argnums=0)
-    def _valid_step(self, variables, batch):
-        return self.generative_model.apply(variables, batch, dataset="test", train=False, rngs={"time_sampling": jax.random.key(42), "noise": jax.random.key(1337), "guiding": jax.random.key(69)},)
+    def validate(self, rngs : dict, variables=None):
+        def valid_step(variables, batch, rngs):
+            return self.generative_model.apply(variables, batch, dataset="test", train=False, rngs=rngs)
+        
+        loss = 0.0
+        for batch in self.valid_dataloader:
+            subrngs, rngs = split_rng_dict(rngs)
+            batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
+            loss += valid_step(variables, batch, subrngs)
 
-    def test(self, variables=None):
+        return loss
+    
+    def test(self, rngs : dict, variables=None):
         """
         Test the generative model.
         """
@@ -278,37 +293,10 @@ class CfgenEstimator:
             else:
                 variables = self.final_model
 
-        loss = 0.0
-        for batch in self.valid_dataloader:
-            batch = jax.tree.map(lambda tensor: tensor.numpy().astype(np.float32), batch) # TODO this is hacky
-            loss += self._valid_step(variables, batch)
-
-
+        subrngs, rngs = split_rng_dict(rngs)
         self.generative_model.apply(variables,
                                     self.valid_data[:]["X"],
                                     "test",
                                     method=FM.compute_metrics_and_plots,
-                                    rngs={"time_sampling": jax.random.key(42), "noise": jax.random.key(1337), "guiding": jax.random.key(69)}
+                                    rngs=subrngs
                                     )
- 
-        return loss
-    
-
-    # TODO stolen from fm.py 
-    def configure_optimizers(self):
-        """
-        Optimizer configuration 
-
-        Returns:
-            dict: Optimizer configuration.
-        """
-        params = list(self.parameters())
-        
-        for covariate in self.feature_embeddings:
-            if not self.feature_embeddings[covariate].one_hot_encode_features:
-                params += list(self.feature_embeddings[covariate].parameters())
-                 
-        optimizer = torch.optim.AdamW(params, 
-                                    self.learning_rate, 
-                                    weight_decay=self.weight_decay)
-        return optimizer

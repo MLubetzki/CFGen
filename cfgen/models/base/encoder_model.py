@@ -114,7 +114,7 @@ class EncoderModel(nn.Module):
                 if not self.covariate_specific_theta:
                     px = NegativeBinomial(mu_hat[mod], jnp.exp(self.theta))
                 else:
-                    px = NegativeBinomial(mu_hat[mod], jnp.exp(self.theta[y]))
+                    px = NegativeBinomial(mu_hat[mod], jnp.exp(self.theta[y])) # TODO fix this, y is not defined here
             elif mod == "atac":
                 if not self.is_binarized:
                     px = Poisson(mu_hat[mod])

@@ -24,6 +24,8 @@ from cfgen.models.base.encoder_model import EncoderModel
 class TrainState(train_state.TrainState):
   batch_stats: dict
 
+# TODO jitting methods is not ideal. restructuring the code to avoid this would be better
+
 class EncoderEstimator:
     """Class for training and using the cfgen model."""
     
@@ -132,7 +134,7 @@ class EncoderEstimator:
         batch_stats = variables["batch_stats"]
 
         # Set up the optimizer and training state
-        optimizer = optax.adam(self.args.encoder.learning_rate)
+        optimizer = optax.adamw(self.args.encoder.learning_rate, weight_decay=self.args.encoder.weight_decay)
         state = TrainState.create(
             apply_fn=self.encoder_model.apply,
             params=params,

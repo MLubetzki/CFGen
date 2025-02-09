@@ -1,5 +1,6 @@
 from typing import Callable, List, Optional
 
+import jax
 import jax.numpy as jnp
 import flax.linen as nn
 
@@ -54,6 +55,20 @@ def kl_std_normal(mean_squared, var):
         torch.Tensor: Gaussian KL divergence.
     """
     return 0.5 * (var + mean_squared - jnp.log(var.clamp(min=1e-15)) - 1.0)
+
+def split_rng_dict(rng_dict, num : int=2):
+    """
+    Splits a dictionary of random number generators into `num` parts.
+
+    Args:
+        rng_dict (dict): Dictionary of random number generators.
+        num (int): Number of parts to split the dictionary into.
+
+    Returns:
+        List[dict]: List of dictionaries of random number generators.
+    """
+    split_dict = jax.tree.map(lambda x: jax.random.split(x, num), rng_dict)
+    return [{k: split_dict[k][i] for k in rng_dict} for i in range(num)]
 
 class MLP(nn.Module):
     dims: List[int]
