@@ -130,11 +130,11 @@ class MLPTimeStep(nn.Module):
                 
         # Embed condition
         if self.guided_conditioning:
-            guiding_prngkey, subkey = random.split(guiding_prngkey) # TODO check if this works as intended
+            guiding_prngkey, subkey = random.split(guiding_prngkey)
             is_conditioned = random.bernoulli(subkey, self.conditioning_probability) if not inference else 1 # Bernoulli variable to decide whether to condition or not
             if self.conditional and is_conditioned and not unconditional:
                 if covariate == None:  
-                    guiding_prngkey, subkey = random.split(guiding_prngkey) # TODO check if this works as intended
+                    guiding_prngkey, subkey = random.split(guiding_prngkey)
                     covariate = self.covariate_list[int(random.choice(subkey, len(self.covariate_list)))]
                 emb = emb + y[covariate]
         else:

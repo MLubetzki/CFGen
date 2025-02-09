@@ -156,7 +156,7 @@ class FM(nn.Module):
     def _conditioning_wrapper(self,
                                 t: jnp.ndarray,  # Time tensor
                                 x: jnp.ndarray,  # Input tensor
-                                diff_args: any,  # TODO does this fix the issue?
+                                diff_args: any,  # Additional arguments from diffrax
                                 l: dict,  # Log library size
                                 y: dict,  # Conditioning variable
                                 guidance_weights: dict,  # Weights for attribute-based guiding

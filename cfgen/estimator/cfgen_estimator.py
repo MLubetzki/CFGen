@@ -85,13 +85,13 @@ class CfgenEstimator:
         self.train_dataloader = torch.utils.data.DataLoader(self.train_data,
                                                             batch_size=self.args.training_config.batch_size,
                                                             shuffle=True,
-                                                            num_workers=4, 
+                                                            # num_workers=1, 
                                                             drop_last=True)
         
         self.valid_dataloader = torch.utils.data.DataLoader(self.valid_data,
                                                             batch_size=self.args.training_config.batch_size,
                                                             shuffle=False,
-                                                            num_workers=4, 
+                                                            # num_workers=1, 
                                                             drop_last=True)
     
     def get_fixed_rna_model_params(self):
@@ -248,7 +248,6 @@ class CfgenEstimator:
                 ckpt = {"model": state}
                 self.checkpointer.save(self.training_dir / "checkpoints" / "fm" / "early_stopping_checkpoint", ckpt, save_args=self.orbax_save_args, force=True)
 
-
         self.final_model = {"params": state.params, "batch_stats": state.batch_stats}
         final_checkpoint = {"model": state}
         self.checkpointer.save(self.training_dir / "checkpoints" /"fm" / "final_checkpoint", final_checkpoint, save_args=self.orbax_save_args)
@@ -271,7 +270,7 @@ class CfgenEstimator:
 
         return state, loss
     
-    def validate(self, rngs : dict, variables=None):
+    def validate(self, rngs : dict, variables):
         def valid_step(variables, batch, rngs):
             return self.generative_model.apply(variables, batch, dataset="test", train=False, rngs=rngs)
         
