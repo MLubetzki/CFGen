@@ -260,10 +260,12 @@ class FM(nn.Module):
         term = ODETerm(denoising_model_ode)
         solver = Dopri5()
         x0 = diffeqsolve(term, solver, t0=0.0, t1=1.0, y0=z, dt0=1.0/n_sample_steps).ys[-1].squeeze()
-        
-        # If we use joint layers, split the output to get separate z's
+        # import IPython; IPython.embed() ; exit(1)
+        # If we're not using joint layers, split the output to get separate z's
         if not self.encoder_model.encoder_multimodal_joint_layers:
-            x0 = jnp.split(x0, [self.in_dim[d] for d in self.modality_list], axis=1)
+            modality_dims = jnp.array([self.in_dim[d] for d in self.modality_list])
+            split_lens = jnp.cumsum(modality_dims)[:-1]
+            x0 = jnp.split(x0, split_lens, axis=1)
             x0 = {mod: x0[i] for i, mod in enumerate(self.modality_list)}
 
         # Exponentiate log-size factor for decoding  
@@ -291,7 +293,6 @@ class FM(nn.Module):
             sample[mod] = distr.sample(self.make_rng("distr"))
         return sample
     
-    # @torch.no_grad()
     def batched_sample(self, 
                        batch_size, 
                        repetitions,
@@ -333,7 +334,7 @@ class FM(nn.Module):
                                     conditioning_covariates,
                                     covariate_indices_batch, 
                                     log_size_factor_batch, 
-                                    unconditional)
+                                    unconditional)            
                 
             for mod in X_samples:
                 total_samples[mod].append(X_samples[mod])                
